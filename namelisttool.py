@@ -1403,8 +1403,8 @@ class NamelistTool(tk.Tk):
     def _load(self):
         path = filedialog.askopenfilename(
             title="Open namelist.input",
-            filetypes=[('Namelist files','namelist.input namelist*.input *.input'),
-                       ('All files','*')])
+            filetypes=[('Namelist / input files', '*.input'),
+                       ('All files', '*.*')])
         if not path:
             return
         try:
@@ -1441,7 +1441,7 @@ class NamelistTool(tk.Tk):
         path = filedialog.asksaveasfilename(
             initialfile='namelist.input',
             defaultextension='.input',
-            filetypes=[('Namelist files','*.input'),('All files','*')],
+            filetypes=[('Namelist / input files', '*.input'), ('All files', '*.*')],
             title="Save namelist.input")
         if not path:
             return
