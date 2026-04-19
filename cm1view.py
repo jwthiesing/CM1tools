@@ -171,18 +171,46 @@ class CM1Viewer(tk.Tk):
     # ── variables ────────────────────────────────────────────────────────────
 
     def _build_vars(self):
-        self.v_field   = tk.StringVar()
-        self.v_cmap    = tk.StringVar(value='RdBu_r')
-        self.v_view    = tk.StringVar(value='plan')      # plan | xz | yz
-        self.v_symcb   = tk.BooleanVar(value=False)
-        self.v_vmin    = tk.StringVar(value='')
-        self.v_vmax    = tk.StringVar(value='')
-        self.v_winds   = tk.BooleanVar(value=False)
-        self.v_wind_skip = tk.IntVar(value=4)
-        self.v_gif_t0  = tk.StringVar(value='0')
-        self.v_gif_t1  = tk.StringVar(value='')
+        self.v_field      = tk.StringVar()
+        self.v_cmap       = tk.StringVar(value='RdBu_r')
+        self.v_view       = tk.StringVar(value='plan')
+        self.v_symcb      = tk.BooleanVar(value=False)
+        self.v_vmin       = tk.StringVar(value='')
+        self.v_vmax       = tk.StringVar(value='')
+        self.v_winds      = tk.BooleanVar(value=False)
+        self.v_wind_skip  = tk.IntVar(value=4)
+        self.v_ctr_field  = tk.StringVar(value='')
+        self.v_ctr_levels = tk.IntVar(value=8)
+        self.v_ctr_color  = tk.StringVar(value='black')
+        self.v_ctr_labels = tk.BooleanVar(value=False)
+        self.v_xmin = tk.StringVar(value='')
+        self.v_xmax = tk.StringVar(value='')
+        self.v_ymin = tk.StringVar(value='')
+        self.v_ymax = tk.StringVar(value='')
+        self.v_xlim_sym = tk.BooleanVar(value=False)
+        self.v_ylim_sym = tk.BooleanVar(value=False)
+        self.v_gif_t0     = tk.StringVar(value='0')
+        self.v_gif_t1     = tk.StringVar(value='')
 
     # ── UI ───────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _autocomplete(combo, get_full_list, on_commit=None):
+        """Let the user type to filter a combobox; commit on Return or selection."""
+        def _filter(event=None):
+            if event and event.keysym in ('Return', 'KP_Enter'):
+                if on_commit:
+                    on_commit()
+                return
+            if event and event.keysym in ('Up', 'Down', 'Escape', 'Tab'):
+                return
+            typed = combo.get().lower()
+            full  = get_full_list()
+            combo['values'] = [v for v in full if typed in v.lower()] if typed else full
+
+        combo.configure(state='normal')
+        combo.bind('<KeyRelease>', _filter)
+        combo.bind('<<ComboboxSelected>>', lambda _: on_commit() if on_commit else None)
 
     def _build_ui(self):
         # ── top bar: file + field ────────────────────────────────────────
@@ -194,32 +222,38 @@ class CM1Viewer(tk.Tk):
         self._file_lbl.pack(side='left', padx=8)
 
         ttk.Label(top, text="Field:").pack(side='left')
-        self._field_cb = ttk.Combobox(top, textvariable=self.v_field, width=18,
-                                      state='readonly')
+        self._field_cb = ttk.Combobox(top, textvariable=self.v_field, width=18)
         self._field_cb.pack(side='left', padx=4)
-        self._field_cb.bind('<<ComboboxSelected>>', lambda _: self._plot())
+        self._all_fields = []
+        self._autocomplete(self._field_cb, lambda: self._all_fields, self._plot)
 
         ttk.Label(top, text="Colormap:").pack(side='left', padx=(12, 2))
-        ttk.Combobox(top, textvariable=self.v_cmap, values=CMAPS,
-                     width=14, state='readonly').pack(side='left', padx=4)
+        self._cmap_cb = ttk.Combobox(top, textvariable=self.v_cmap, width=14)
+        self._cmap_cb.pack(side='left', padx=4)
+        self._autocomplete(self._cmap_cb, lambda: CMAPS, self._plot)
         self.v_cmap.trace_add('write', lambda *_: self._plot())
 
-        # ── main paned window ────────────────────────────────────────────
-        pane = tk.PanedWindow(self, orient='horizontal', sashwidth=5,
-                              sashrelief='ridge')
-        pane.pack(fill='both', expand=True, padx=6, pady=2)
+        # ── main area: fixed left panel + expanding right plot ───────────
+        main = ttk.Frame(self)
+        main.pack(fill='both', expand=True, padx=6, pady=2)
 
-        # --- Left controls ---
-        left = ttk.Frame(pane, width=210)
-        pane.add(left, minsize=200)
+        # Left controls — packed first so it claims its space before right expands
+        left = ttk.Frame(main, width=230)
+        left.pack(side='left', fill='y')
+        left.pack_propagate(False)
         self._build_controls(left)
 
-        # --- Right: plot ---
-        right = ttk.Frame(pane)
-        pane.add(right, minsize=600)
+        ttk.Separator(main, orient='vertical').pack(side='left', fill='y', padx=2)
 
-        self._fig  = Figure(figsize=(7, 5.5), dpi=100)
-        self._ax   = self._fig.add_subplot(111)
+        # Right plot — fills all remaining space
+        right = ttk.Frame(main)
+        right.pack(side='left', fill='both', expand=True)
+
+        self._fig = Figure(dpi=100)
+        # Fixed axes positions so colorbar never steals space from the plot
+        self._ax  = self._fig.add_axes([0.10, 0.10, 0.74, 0.82])
+        self._cax = self._fig.add_axes([0.87, 0.10, 0.03, 0.82])
+        self._cbar = None
         self._canvas = FigureCanvasTkAgg(self._fig, master=right)
         self._canvas.get_tk_widget().pack(fill='both', expand=True)
         tb = NavigationToolbar2Tk(self._canvas, right, pack_toolbar=False)
@@ -278,6 +312,46 @@ class CM1Viewer(tk.Tk):
         ttk.Button(cf, text="Reset to auto",
                    command=self._reset_range).pack(padx=6, pady=4)
 
+        # Axis limits
+        af = ttk.LabelFrame(parent, text="Axis limits")
+        af.pack(fill='x', padx=6, pady=4)
+
+        def _lim_entry(parent_row, v_this, v_other, v_sym, is_max):
+            """Entry that mirrors its partner when symmetric is on."""
+            e = ttk.Entry(parent_row, textvariable=v_this, width=7)
+            def _apply(event=None):
+                if v_sym.get():
+                    try:
+                        val = float(v_this.get())
+                        v_other.set(f'{-val:.6g}')
+                    except ValueError:
+                        pass
+                self._plot()
+            e.bind('<Return>', _apply)
+            e.bind('<FocusOut>', _apply)
+            return e
+
+        for axis_lbl, v_min, v_max, v_sym, sym_cmd in [
+            ('X', self.v_xmin, self.v_xmax, self.v_xlim_sym, self._on_xlim_sym),
+            ('Y', self.v_ymin, self.v_ymax, self.v_ylim_sym, self._on_ylim_sym),
+        ]:
+            row = ttk.Frame(af)
+            row.pack(fill='x', padx=6, pady=2)
+            ttk.Label(row, text=axis_lbl, width=2).pack(side='left')
+            ttk.Label(row, text="min", width=3).pack(side='left')
+            _lim_entry(row, v_min, v_max, v_sym, is_max=False).pack(side='left', padx=(0, 4))
+            ttk.Label(row, text="max", width=3).pack(side='left')
+            _lim_entry(row, v_max, v_min, v_sym, is_max=True).pack(side='left')
+
+            sym_row = ttk.Frame(af)
+            sym_row.pack(fill='x', padx=6, pady=(0, 2))
+            ttk.Checkbutton(sym_row, text=f"Symmetric {axis_lbl} (±)",
+                            variable=v_sym,
+                            command=sym_cmd).pack(side='left')
+
+        ttk.Button(af, text="Reset to auto",
+                   command=self._reset_lims).pack(padx=6, pady=(0, 4))
+
         # Wind overlay
         wf = ttk.LabelFrame(parent, text="Wind overlay")
         wf.pack(fill='x', padx=6, pady=4)
@@ -289,6 +363,37 @@ class CM1Viewer(tk.Tk):
         ttk.Label(row, text="Skip N:").pack(side='left')
         ttk.Spinbox(row, from_=1, to=20, textvariable=self.v_wind_skip,
                     width=4, command=self._plot).pack(side='left', padx=4)
+
+        # Contour overlay
+        ctrf = ttk.LabelFrame(parent, text="Contour overlay")
+        ctrf.pack(fill='x', padx=6, pady=4)
+        ttk.Label(ctrf, text="Variable:").pack(anchor='w', padx=6, pady=(4, 0))
+        self._ctr_cb = ttk.Combobox(ctrf, textvariable=self.v_ctr_field, width=18)
+        self._ctr_cb.pack(fill='x', padx=6, pady=2)
+        self._all_ctr_fields = ['']
+        self._autocomplete(self._ctr_cb,
+                           lambda: self._all_ctr_fields, self._plot)
+
+        row = ttk.Frame(ctrf)
+        row.pack(fill='x', padx=6, pady=2)
+        ttk.Label(row, text="Levels:").pack(side='left')
+        ttk.Spinbox(row, from_=2, to=40, textvariable=self.v_ctr_levels,
+                    width=4, command=self._plot).pack(side='left', padx=4)
+        ttk.Checkbutton(ctrf, text="Label contours", variable=self.v_ctr_labels,
+                        command=self._plot).pack(anchor='w', padx=6, pady=(0, 2))
+
+        ttk.Label(ctrf, text="Color / colormap:").pack(anchor='w', padx=6)
+        _ctr_colors = [
+            'black', 'white', 'gray', 'red', 'blue', 'green',
+            'orange', 'cyan', 'magenta', 'yellow',
+            'viridis', 'plasma', 'RdBu_r', 'bwr', 'Reds', 'Blues',
+            'turbo', 'jet', 'gist_ncar',
+        ]
+        self._ctr_color_cb = ttk.Combobox(
+            ctrf, textvariable=self.v_ctr_color, width=18, values=_ctr_colors)
+        self._ctr_color_cb.pack(fill='x', padx=6, pady=(2, 6))
+        self._autocomplete(self._ctr_color_cb, lambda: _ctr_colors, self._plot)
+        self.v_ctr_color.trace_add('write', lambda *_: self._plot())
 
     def _build_time_bar(self, parent):
         # Playback row
@@ -342,7 +447,7 @@ class CM1Viewer(tk.Tk):
     def _open(self):
         paths = filedialog.askopenfilenames(
             title="Open CM1 netCDF file(s)",
-            filetypes=[("NetCDF files", "*.nc *.nc4"), ("All files", "*.*")])
+            filetypes=[("NetCDF files", "*.nc"), ("All files", "*.*")])
         if not paths:
             return
         try:
@@ -360,9 +465,14 @@ class CM1Viewer(tk.Tk):
             foreground='black')
 
         all_fields = self._ds.fields_3d + self._ds.fields_2d
+        self._all_fields = all_fields
+        self._all_ctr_fields = [''] + all_fields
         self._field_cb['values'] = all_fields
+        self._ctr_cb['values']   = self._all_ctr_fields
+        self._cmap_cb['values']  = CMAPS
         if all_fields:
             self.v_field.set(all_fields[0])
+        self.v_ctr_field.set('')
 
         nt = self._ds.ntimes
         self._t_slider.config(to=max(nt - 1, 1))
@@ -377,6 +487,7 @@ class CM1Viewer(tk.Tk):
         self.v_gif_t1.set(str(int(self._ds.times[-1])) if nt > 0 else '')
 
         self._plot()
+        self._canvas.draw()   # force immediate render after dialog closes
 
     # ── slider callbacks ─────────────────────────────────────────────────────
 
@@ -470,6 +581,53 @@ class CM1Viewer(tk.Tk):
         self.v_vmax.set('')
         self._plot()
 
+    def _reset_lims(self):
+        for v in (self.v_xmin, self.v_xmax, self.v_ymin, self.v_ymax):
+            v.set('')
+        self.v_xlim_sym.set(False)
+        self.v_ylim_sym.set(False)
+        self._plot()
+
+    def _on_xlim_sym(self):
+        if self.v_xlim_sym.get():
+            # Mirror whichever bound is already set
+            try:
+                self.v_xmin.set(f'{-float(self.v_xmax.get()):.6g}')
+            except ValueError:
+                try:
+                    self.v_xmax.set(f'{-float(self.v_xmin.get()):.6g}')
+                except ValueError:
+                    pass
+        self._plot()
+
+    def _on_ylim_sym(self):
+        if self.v_ylim_sym.get():
+            try:
+                self.v_ymin.set(f'{-float(self.v_ymax.get()):.6g}')
+            except ValueError:
+                try:
+                    self.v_ymax.set(f'{-float(self.v_ymin.get()):.6g}')
+                except ValueError:
+                    pass
+        self._plot()
+
+    def _get_lims(self, v_min, v_max, v_sym, auto_data):
+        try:
+            lo = float(v_min.get())
+        except ValueError:
+            lo = None
+        try:
+            hi = float(v_max.get())
+        except ValueError:
+            hi = None
+        if lo is None and hi is None:
+            return None, None   # fully auto
+        if lo is None:
+            lo = -hi if v_sym.get() else float(np.nanmin(auto_data))
+        if hi is None:
+            hi = -lo if v_sym.get() else float(np.nanmax(auto_data))
+        return lo, hi
+
     def _get_range(self, data):
         try:
             vmin = float(self.v_vmin.get())
@@ -530,12 +688,12 @@ class CM1Viewer(tk.Tk):
         is_3d = data.ndim == 3
 
         if not is_3d:
-            # 2-D surface field
+            # 2-D surface field: data is (ny, nx)
             plot_data = data
             vmin, vmax = self._get_range(plot_data)
-            im = ax.pcolormesh(xh, yh, plot_data.T,
+            im = ax.pcolormesh(xh, yh, plot_data,
                                cmap=cmap, norm=Normalize(vmin, vmax),
-                               shading='auto')
+                               shading='nearest')
             self._add_colorbar(im, field)
             ax.set_xlabel('x  (km)')
             ax.set_ylabel('y  (km)')
@@ -550,11 +708,12 @@ class CM1Viewer(tk.Tk):
         frac = float(self._cs_slider.get())
 
         if view == 'plan':
-            plot_data = data[:, :, ki]
+            # data is (nz, ny, nx); select level ki → (ny, nx)
+            plot_data = data[ki, :, :]
             vmin, vmax = self._get_range(plot_data)
-            im = ax.pcolormesh(xh, yh, plot_data.T,
+            im = ax.pcolormesh(xh, yh, plot_data,
                                cmap=cmap, norm=Normalize(vmin, vmax),
-                               shading='auto')
+                               shading='nearest')
             self._add_colorbar(im, field)
             if self.v_winds.get():
                 self._overlay_winds_plan(ax, ki, xh, yh, t_sec)
@@ -567,11 +726,12 @@ class CM1Viewer(tk.Tk):
 
         elif view == 'xz':
             ji = int(np.clip(frac * (len(yh) - 1), 0, len(yh) - 1))
+            # data is (nz, ny, nx); select y=ji → (nz, nx)
             plot_data = data[:, ji, :]
             vmin, vmax = self._get_range(plot_data)
-            im = ax.pcolormesh(xh, zh, plot_data.T,
+            im = ax.pcolormesh(xh, zh, plot_data,
                                cmap=cmap, norm=Normalize(vmin, vmax),
-                               shading='auto')
+                               shading='nearest')
             self._add_colorbar(im, field)
             if self.v_winds.get():
                 self._overlay_winds_xz(ax, ji, xh, zh, t_sec)
@@ -584,11 +744,12 @@ class CM1Viewer(tk.Tk):
 
         elif view == 'yz':
             ii = int(np.clip(frac * (len(xh) - 1), 0, len(xh) - 1))
-            plot_data = data[ii, :, :]
+            # data is (nz, ny, nx); select x=ii → (nz, ny)
+            plot_data = data[:, :, ii]
             vmin, vmax = self._get_range(plot_data)
-            im = ax.pcolormesh(yh, zh, plot_data.T,
+            im = ax.pcolormesh(yh, zh, plot_data,
                                cmap=cmap, norm=Normalize(vmin, vmax),
-                               shading='auto')
+                               shading='nearest')
             self._add_colorbar(im, field)
             if self.v_winds.get():
                 self._overlay_winds_yz(ax, ii, yh, zh, t_sec)
@@ -600,14 +761,69 @@ class CM1Viewer(tk.Tk):
                 fontsize=10)
 
         ax.set_aspect('auto')
+        self._draw_contour(ax, view, ki, frac, xh, yh, zh)
+
+        # Apply user axis limits (x = horizontal axis, y = vertical axis)
+        xlim = self._get_lims(self.v_xmin, self.v_xmax, self.v_xlim_sym,
+                               np.array(ax.get_xlim()))
+        ylim = self._get_lims(self.v_ymin, self.v_ymax, self.v_ylim_sym,
+                               np.array(ax.get_ylim()))
+        if xlim[0] is not None:
+            ax.set_xlim(xlim)
+        if ylim[0] is not None:
+            ax.set_ylim(ylim)
+
         self._canvas.draw_idle()
 
-    def _add_colorbar(self, im, field):
+    def _draw_contour(self, ax, view, ki, frac, xh, yh, zh):
+        ctr_field = self.v_ctr_field.get()
+        if not ctr_field:
+            return
         try:
-            self._cbar.remove()
+            cdata = self._ds.get_field(ctr_field, self._t_idx)
+        except Exception:
+            return
+
+        import matplotlib.cm as mpl_cm
+        color_val = self.v_ctr_color.get()
+        nlevs     = max(2, self.v_ctr_levels.get())
+        is_cmap   = color_val in plt.colormaps()
+
+        # slice same way as pcolormesh
+        if cdata.ndim == 2:
+            if view == 'plan':
+                cslice, X, Y = cdata, xh, yh
+            elif view == 'xz':
+                ji = int(np.clip(frac * (len(yh) - 1), 0, len(yh) - 1))
+                cslice, X, Y = cdata, xh, zh
+            else:
+                ii = int(np.clip(frac * (len(xh) - 1), 0, len(xh) - 1))
+                cslice, X, Y = cdata, yh, zh
+        else:
+            if view == 'plan':
+                cslice, X, Y = cdata[ki, :, :], xh, yh
+            elif view == 'xz':
+                ji = int(np.clip(frac * (len(yh) - 1), 0, len(yh) - 1))
+                cslice, X, Y = cdata[:, ji, :], xh, zh
+            else:
+                ii = int(np.clip(frac * (len(xh) - 1), 0, len(xh) - 1))
+                cslice, X, Y = cdata[:, :, ii], yh, zh
+
+        try:
+            kwargs = dict(levels=nlevs, linewidths=1.2)
+            if is_cmap:
+                kwargs['cmap'] = color_val
+            else:
+                kwargs['colors'] = color_val
+            cs = ax.contour(X, Y, cslice, **kwargs)
+            if self.v_ctr_labels.get():
+                ax.clabel(cs, inline=True, fontsize=7, fmt='%g')
         except Exception:
             pass
-        self._cbar = self._fig.colorbar(im, ax=self._ax, fraction=0.046, pad=0.04)
+
+    def _add_colorbar(self, im, field):
+        self._cax.cla()
+        self._cbar = self._fig.colorbar(im, cax=self._cax)
         units = self._ds.get_units(field)
         if units:
             self._cbar.set_label(units, fontsize=9)
@@ -624,34 +840,37 @@ class CM1Viewer(tk.Tk):
             return 'vinterp', 'winterp'
 
     def _overlay_winds_plan(self, ax, ki, xh, yh, t_sec):
+        # wind data is (nz, ny, nx); select level ki → (ny, nx)
         sk = max(1, self.v_wind_skip.get())
         for u_n, v_n in [('uinterp', 'vinterp'), ('u', 'v')]:
             if u_n in self._ds.fields_3d and v_n in self._ds.fields_3d:
-                u = self._ds.get_field(u_n, self._t_idx)[:, :, ki][::sk, ::sk]
-                v = self._ds.get_field(v_n, self._t_idx)[:, :, ki][::sk, ::sk]
-                ax.quiver(xh[::sk], yh[::sk], u.T, v.T,
+                u = self._ds.get_field(u_n, self._t_idx)[ki, ::sk, ::sk]
+                v = self._ds.get_field(v_n, self._t_idx)[ki, ::sk, ::sk]
+                ax.quiver(xh[::sk], yh[::sk], u, v,
                           scale=None, color='k', alpha=0.6, width=0.002)
                 return
 
     def _overlay_winds_xz(self, ax, ji, xh, zh, t_sec):
+        # wind data is (nz, ny, nx); select y=ji → (nz, nx)
         sk = max(1, self.v_wind_skip.get())
         for u_n in ['uinterp', 'u']:
             for w_n in ['winterp', 'w']:
                 if u_n in self._ds.fields_3d and w_n in self._ds.fields_3d:
-                    u = self._ds.get_field(u_n, self._t_idx)[:, ji, :][::sk, ::sk]
-                    w = self._ds.get_field(w_n, self._t_idx)[:, ji, :][::sk, ::sk]
-                    ax.quiver(xh[::sk], zh[::sk], u.T, w.T,
+                    u = self._ds.get_field(u_n, self._t_idx)[::sk, ji, ::sk]
+                    w = self._ds.get_field(w_n, self._t_idx)[::sk, ji, ::sk]
+                    ax.quiver(xh[::sk], zh[::sk], u, w,
                               scale=None, color='k', alpha=0.6, width=0.002)
                     return
 
     def _overlay_winds_yz(self, ax, ii, yh, zh, t_sec):
+        # wind data is (nz, ny, nx); select x=ii → (nz, ny)
         sk = max(1, self.v_wind_skip.get())
         for v_n in ['vinterp', 'v']:
             for w_n in ['winterp', 'w']:
                 if v_n in self._ds.fields_3d and w_n in self._ds.fields_3d:
-                    v = self._ds.get_field(v_n, self._t_idx)[ii, :, :][::sk, ::sk]
-                    w = self._ds.get_field(w_n, self._t_idx)[ii, :, :][::sk, ::sk]
-                    ax.quiver(yh[::sk], zh[::sk], v.T, w.T,
+                    v = self._ds.get_field(v_n, self._t_idx)[::sk, ::sk, ii]
+                    w = self._ds.get_field(w_n, self._t_idx)[::sk, ::sk, ii]
+                    ax.quiver(yh[::sk], zh[::sk], v, w,
                               scale=None, color='k', alpha=0.6, width=0.002)
                     return
 
