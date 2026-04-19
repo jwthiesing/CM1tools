@@ -151,6 +151,435 @@ class CM1Dataset:
 
 
 # ---------------------------------------------------------------------------
+# Radar simulation (physics ported from StormBox/simulation/instruments/radar.py,
+# adapted for CM1 netCDF multi-species NSSL 2-moment microphysics)
+# ---------------------------------------------------------------------------
+
+_RC_LIGHT   = 3e8        # m/s
+_RK2        = 0.93       # |K|² liquid water
+_RK2_ICE    = 0.20       # |K|² ice/snow
+_RE_EFF     = 8.5e6      # m  (standard 4/3 Earth refraction)
+_V_RAIN     = 7.0        # m/s  fall speed – rain
+_V_SNOW     = 1.5        # m/s  fall speed – snow
+_V_GRPL     = 3.0        # m/s  fall speed – graupel
+_V_HAIL     = 10.0       # m/s  fall speed – hail
+_RL_SYS_DB  = 3.0        # dB  system losses
+_RETA       = 0.6        # antenna efficiency
+_RS_MIN_W   = 5e-13      # W   minimum detectable signal
+
+# Band: (attenuation a,b), lambda_m, (KDP a,b), gamma
+_RBAND = {
+    'S':  dict(attn=(0.00017,0.71), lam=0.10, kdp=(0.0365,0.890), gamma=0.053),
+    'C':  dict(attn=(0.00080,0.74), lam=0.05, kdp=(0.0743,0.895), gamma=0.250),
+    'X':  dict(attn=(0.00372,0.72), lam=0.03, kdp=(0.1507,0.907), gamma=0.370),
+    'Ka': dict(attn=(0.026,  0.69), lam=0.008,kdp=(0.300, 0.950), gamma=0.500),
+}
+_RZDR_A, _RZDR_B = 1.74, -0.66   # ZDR = A*D0 + B (dB)
+
+
+class CM1Radar:
+    """Doppler radar simulator for CM1 netCDF output.
+
+    Adapts StormBox DopplerRadar for CM1's km-based grid and NSSL 2-moment
+    microphysics (separate qr / qs / qg / qh species, T from th+prs).
+    """
+
+    def __init__(self, radar_x_km, radar_y_km, cfg, ds):
+        self._rx = radar_x_km * 1000.0   # m (East from domain origin)
+        self._ry = radar_y_km * 1000.0   # m (North)
+
+        # ── Hardware ────────────────────────────────────────────────────────
+        self.band    = cfg.get('band', 'S')
+        bd           = _RBAND[self.band]
+        self.lam_m   = bd['lam']
+        self.D_m     = float(cfg.get('dish_m', 4.2))
+        self.Pt_W    = float(cfg.get('power_kw', 250.0)) * 1000.0
+        self.theta_beam_rad = 1.22 * self.lam_m / self.D_m
+        self.theta_beam_deg = np.degrees(self.theta_beam_rad)
+        G = _RETA * (np.pi * self.D_m / self.lam_m) ** 2
+        Lsys = 10 ** (_RL_SYS_DB / 10.0)
+        self._C_radar = (self.Pt_W * G**2 * self.theta_beam_rad**2 *
+                         _RC_LIGHT * _RK2 * np.pi**3 /
+                         (1024.0 * np.log(2) * self.lam_m**2 * Lsys))
+
+        # ── Operational defaults ─────────────────────────────────────────────
+        self.prf_hz         = float(cfg.get('prf_hz', 1000.0))
+        self.tau_us         = float(cfg.get('pulse_us', 1.0))
+        self.clutter_filter = bool(cfg.get('clutter_filter', False))
+        self.v_notch_ms     = float(cfg.get('v_notch_ms', 1.5))
+
+        # ── CM1 grid (km → m) ────────────────────────────────────────────────
+        self._xh_m = ds.xh * 1000.0
+        self._yh_m = ds.yh * 1000.0
+        self._zh_m = ds.zh * 1000.0
+        self._nx   = len(ds.xh)
+        self._ny   = len(ds.yh)
+        self._nz   = len(ds.zh)
+        self._dx   = float(self._xh_m[1] - self._xh_m[0]) if self._nx > 1 else 2000.0
+        self._dy   = float(self._yh_m[1] - self._yh_m[0]) if self._ny > 1 else 2000.0
+
+        self._fields_3d = set(ds.fields_3d)
+        self._update_derived()
+        self._precompute_barnes()
+
+    # ── derived quantities ───────────────────────────────────────────────────
+
+    def _update_derived(self):
+        tau_s          = self.tau_us * 1e-6
+        self.r_max_m   = _RC_LIGHT / (2.0 * self.prf_hz)
+        self.v_max_ms  = self.lam_m * self.prf_hz / 4.0
+        self.delta_r_m = _RC_LIGHT * tau_s / 2.0
+        max_r          = np.hypot(self._nx * self._dx, self._ny * self._dy)
+        self.n_gates   = min(max(1, int(self.r_max_m / self.delta_r_m)),
+                             max(1, int(max_r / self.delta_r_m)))
+        self.n_az      = min(max(1, int(360.0 / self.theta_beam_deg)), 720)
+        r_ref = 10e3
+        Z_min_lin = _RS_MIN_W * r_ref**2 * 1e18 / (self._C_radar * tau_s)
+        self.z_min_ref_dbz = 10.0 * np.log10(max(Z_min_lin, 1e-30))
+        # DZ 6.23: M = number of independent samples per dwell (assume 20°/s scan rate)
+        self.n_samples = max(1, int(self.prf_hz * self.theta_beam_deg / 20.0))
+
+    # ── Barnes 3×3 horizontal interpolation weights ──────────────────────────
+
+    def _precompute_barnes(self):
+        kappa2 = self._dx * self._dx
+        az_rad = np.radians(np.linspace(0, 360, self.n_az, endpoint=False))
+        gate_r = np.arange(1, self.n_gates + 1, dtype=np.float32) * self.delta_r_m
+        gx_m = (self._rx + gate_r[None, :] * np.sin(az_rad[:, None])).ravel().astype(np.float64)
+        gy_m = (self._ry + gate_r[None, :] * np.cos(az_rad[:, None])).ravel().astype(np.float64)
+        # searchsorted handles stretched/non-uniform grids correctly
+        ic0  = np.clip(np.searchsorted(self._xh_m, gx_m) - 1, 0, self._nx - 1).astype(np.int32)
+        ir0  = np.clip(np.searchsorted(self._yh_m, gy_m) - 1, 0, self._ny - 1).astype(np.int32)
+        di   = np.array([-1,-1,-1, 0,0,0, 1,1,1], dtype=np.int32)
+        dj   = np.array([-1, 0, 1,-1,0,1,-1,0,1], dtype=np.int32)
+        all_iy = np.clip(ir0[:,None] + di[None,:], 0, self._ny-1).astype(np.int32)
+        all_ix = np.clip(ic0[:,None] + dj[None,:], 0, self._nx-1).astype(np.int32)
+        # Use actual grid coordinates (not reconstructed from uniform spacing)
+        nb_x   = self._xh_m[all_ix]
+        nb_y   = self._yh_m[all_iy]
+        dxn    = gx_m[:,None] - nb_x
+        dyn    = gy_m[:,None] - nb_y
+        w      = np.exp(-(dxn*dxn + dyn*dyn).astype(np.float32) / kappa2)
+        w     /= np.maximum(w.sum(axis=1, keepdims=True), 1e-10)
+        self._biy = all_iy
+        self._bix = all_ix
+        self._bw  = w.astype(np.float32)
+
+    # ── state extraction from CM1Dataset ─────────────────────────────────────
+
+    def _gf(self, ds, t_idx, names):
+        """Return first available 3-D field or zeros."""
+        for n in names:
+            if n in self._fields_3d:
+                return ds.get_field(n, t_idx).astype(np.float32)
+        return np.zeros((self._nz, self._ny, self._nx), dtype=np.float32)
+
+    def _extract(self, ds, t_idx):
+        th  = self._gf(ds, t_idx, ['th'])
+        prs = self._gf(ds, t_idx, ['prs'])
+        T_K  = th * (np.maximum(prs, 1.0) / 1e5) ** (287.0 / 1004.0)
+        rho  = np.maximum(prs, 1.0) / (287.0 * np.maximum(T_K, 100.0))
+        return dict(
+            T_K = T_K,
+            rho = rho,
+            qr  = self._gf(ds, t_idx, ['qr']),
+            qc  = self._gf(ds, t_idx, ['qc']),
+            qi  = self._gf(ds, t_idx, ['qi']),
+            qs  = self._gf(ds, t_idx, ['qs']),
+            qg  = self._gf(ds, t_idx, ['qg']),
+            qh  = self._gf(ds, t_idx, ['qh']),
+            u   = self._gf(ds, t_idx, ['uinterp', 'u']),
+            v   = self._gf(ds, t_idx, ['vinterp', 'v']),
+            w   = self._gf(ds, t_idx, ['winterp', 'w']),
+            tke = self._gf(ds, t_idx, ['tke']),
+        )
+
+    # ── multi-species reflectivity (CM1 NSSL 2-moment) ────────────────────────
+
+    def _compute_Z(self, qr, qs, qg, qh, qc, T_K, rho):
+        """Z [mm⁶ m⁻³] from CM1's separate hydrometeor species.
+
+        Phase state is derived from species mixing ratios, not temperature.
+        Melting-layer Z enhancement scales with liquid/ice coexistence (disorder).
+        """
+        is_ice = T_K < 273.15
+
+        R_r = np.maximum(qr * rho * _V_RAIN * 3600.0, 0.0)
+        Z_r = 200.0 * np.maximum(R_r, 1e-10) ** 1.6
+
+        R_s = np.maximum(qs * rho * _V_SNOW * 3600.0, 0.0)
+        Z_s = np.where(is_ice,
+                       2000.0 * np.maximum(R_s, 1e-10)**2.0 * (_RK2_ICE / _RK2),
+                       2000.0 * np.maximum(R_s, 1e-10)**2.0)
+
+        R_g = np.maximum(qg * rho * _V_GRPL * 3600.0, 0.0)
+        Z_g = np.where(is_ice,
+                       315.0 * np.maximum(R_g, 1e-10)**1.5 * (_RK2_ICE / _RK2) * 2.5,
+                       315.0 * np.maximum(R_g, 1e-10)**1.5)
+
+        R_h = np.maximum(qh * rho * _V_HAIL * 3600.0, 0.0)
+        Z_h = np.where(is_ice,
+                       630.0 * np.maximum(R_h, 1e-10)**1.75 * (_RK2_ICE / _RK2) * 4.0,
+                       630.0 * np.maximum(R_h, 1e-10)**1.75)
+
+        LWC = qc * rho
+        Z_c = 1.2e8 * np.maximum(LWC, 0.0) ** 2
+
+        # Melting-layer Z enhancement driven by species coexistence, not temperature.
+        # Melting snow develops a liquid shell → dielectric jumps toward liquid.
+        # disorder = 4·lf·(1-lf) ∈ [0,1], peaks at 50/50 liquid+ice mix.
+        liq_frac = np.maximum(qr, 0.0) / (np.maximum(qr + qs + qg + qh, 0.0) + 1e-15)
+        disorder = 4.0 * liq_frac * (1.0 - liq_frac)
+        Z_s = Z_s * (1.0 + 3.0 * disorder)   # melting aggregates: up to ×4
+        Z_r = Z_r * (1.0 + 1.0 * disorder)   # liquid mixing with melt water
+
+        Z_total = np.maximum(Z_r + Z_s + Z_g + Z_h + Z_c, 1e-10).astype(np.float32)
+        R_total = (R_r + R_s + R_g).astype(np.float32)
+        return Z_total, R_total, disorder.astype(np.float32)
+
+    def _compute_pol(self, qr, qs, qi, qg, qh, R, Z_true, disorder):
+        """ZDR and CC from species mixing ratios — no temperature-based forcing.
+
+        disorder = 4·lf·(1-lf) passed in from _compute_Z (consistent liq_frac).
+        """
+        q_ice_tot = np.maximum(qs + qi + qg + qh, 1e-15)
+        liq_frac  = np.maximum(qr, 0.0) / (np.maximum(qr, 0.0) + q_ice_tot)
+
+        # ZDR (dB)
+        D0       = 0.68 * np.maximum(R, 1e-6) ** 0.21
+        zdr_rain = np.maximum(_RZDR_A * D0 + _RZDR_B, 0.0)
+        # Per-species ice ZDR: snow ~0.25, cloud-ice ~0.30, graupel ~0.10, hail ~0
+        zdr_ice  = (qs * 0.25 + qi * 0.30 + qg * 0.10 + qh * 0.0) / q_ice_tot
+        # Partial-melt enhancement: large oblate melting aggregates (peaks at ~0.5 mix)
+        zdr = liq_frac * zdr_rain + (1.0 - liq_frac) * zdr_ice + 2.0 * disorder
+
+        # CC
+        cc_rain = 0.99 - 0.01 * np.clip(R / 50.0, 0.0, 1.0)
+        # Per-species CC: snow 0.97, cloud-ice 0.98, graupel 0.96, hail 0.92
+        cc_ice  = (qs * 0.97 + qi * 0.98 + qg * 0.96 + qh * 0.92) / q_ice_tot
+        cc = liq_frac * cc_rain + (1.0 - liq_frac) * cc_ice - 0.12 * disorder
+
+        no_pcp = Z_true < 1.0
+        zdr = np.where(no_pcp, 0.0, zdr).astype(np.float32)
+        cc  = np.where(no_pcp, 0.0, np.clip(cc, 0.0, 1.0)).astype(np.float32)
+        return zdr, cc
+
+    # ── PPI scan ──────────────────────────────────────────────────────────────
+
+    def scan_ppi(self, ds, t_idx, el_deg):
+        """Return (refl, vel, zdr, kdp_r, cc, gate_r_km, az_deg_edges) for one PPI tilt."""
+        st = self._extract(ds, t_idx)
+        return self._scan_ppi(st, el_deg)
+
+    def _scan_ppi(self, st, el_deg):
+        el_rad = np.radians(el_deg)
+        az_rad = np.radians(np.linspace(0, 360, self.n_az, endpoint=False)).astype(np.float32)
+        gate_r = np.arange(1, self.n_gates + 1, dtype=np.float32) * self.delta_r_m
+        N      = self.n_az * self.n_gates
+
+        r_flat  = np.tile(gate_r, self.n_az)
+        az_flat = np.repeat(az_rad, self.n_gates)
+        sin_az  = np.sin(az_flat)
+        cos_az  = np.cos(az_flat)
+
+        # Height AGL with Earth curvature
+        h_agl = np.clip(r_flat * np.sin(el_rad) + r_flat**2 / (2 * _RE_EFF),
+                        0.0, None).astype(np.float32)
+
+        # Vertical interpolation indices
+        Z_LEV   = self._zh_m.astype(np.float32)
+        k_lvl   = np.clip(np.searchsorted(Z_LEV, h_agl) - 1, 0, self._nz - 2).astype(np.int32)
+        dz_lyr  = np.maximum(Z_LEV[k_lvl + 1] - Z_LEV[k_lvl], 1.0)
+        alpha_z = np.clip((h_agl - Z_LEV[k_lvl]) / dz_lyr, 0.0, 1.0).astype(np.float32)
+
+        iy, ix, bw = self._biy, self._bix, self._bw
+
+        def _s3(field):
+            k   = k_lvl[:, None]
+            lo  = field[k,   iy, ix]
+            hi  = field[k+1, iy, ix]
+            return ((1.0 - alpha_z[:,None]) * lo + alpha_z[:,None] * hi) * bw
+        def _s3sum(field):
+            return _s3(field).sum(axis=1).astype(np.float32)
+
+        qr = _s3sum(st['qr']); qc = _s3sum(st['qc']); qi = _s3sum(st['qi'])
+        qs = _s3sum(st['qs']); qg = _s3sum(st['qg']); qh = _s3sum(st['qh'])
+        T  = _s3sum(st['T_K']); rho = st['rho'][k_lvl, 0, 0]  # profile density
+        # Use full Barnes rho
+        rho = _s3sum(st['rho'])
+        u   = _s3sum(st['u']); v = _s3sum(st['v']); w = _s3sum(st['w'])
+        tke = _s3sum(st['tke'])
+
+        Z_true, R, disorder = self._compute_Z(qr, qs, qg, qh, qc, T, rho)
+
+        # Attenuation
+        bd = _RBAND[self.band]
+        a_att, b_att = bd['attn']
+        a_kdp, b_kdp = bd['kdp']
+        alpha_dBkm   = (a_att * Z_true**b_att).astype(np.float32)
+        A_2d   = (2.0 * alpha_dBkm * (self.delta_r_m / 1000.0)).reshape(self.n_az, self.n_gates)
+        A_cum  = np.concatenate([np.zeros((self.n_az, 1), np.float32),
+                                 np.cumsum(A_2d, axis=1)[:, :-1]], axis=1).ravel()
+        Z_obs_dbz = 10.0 * np.log10(Z_true) - A_cum
+
+        kdp_r    = np.where(R > 0, a_kdp * R**b_kdp, 0.0).astype(np.float32)
+        zdr, cc  = self._compute_pol(qr, qs, qi, qg, qh, R, Z_true, disorder)
+
+        # Noise floor: range-dependent MDS; comparing attenuated Z to range-only floor
+        # is equivalent to requiring Z_true > Z_min_range + A_cum (attenuation included).
+        Z_min_r = self.z_min_ref_dbz + 20.0 * np.log10(np.maximum(r_flat / 10e3, 1e-6))
+        below   = Z_obs_dbz < Z_min_r
+        Z_obs_dbz[below] = np.nan
+        zdr[below]  = np.nan
+        kdp_r[below] = np.nan
+        cc[below]   = np.nan
+
+        # Radial velocity + DZ 6.23 variance noise + aliasing
+        cos_el  = float(np.cos(el_rad))
+        sin_el  = float(np.sin(el_rad))
+        v_r     = u * sin_az * cos_el + v * cos_az * cos_el + w * sin_el
+        sigma_v = np.sqrt(np.maximum(2.0/3.0 * tke, 0.0))
+        T_s     = 1.0 / self.prf_hz
+        var_v   = sigma_v * self.lam_m / (8.0 * self.n_samples * T_s * np.sqrt(np.pi))
+        std_v   = np.sqrt(np.maximum(var_v, 0.0)).astype(np.float32)
+        v_r_obs = v_r + np.random.normal(0.0, 1.0, size=v_r.shape).astype(np.float32) * std_v
+        v_alias = ((v_r_obs + self.v_max_ms) % (2.0 * self.v_max_ms)) - self.v_max_ms
+        v_alias[below] = np.nan
+
+        if self.clutter_filter:
+            cf = (np.abs(v_r) < self.v_notch_ms) & ~below
+            Z_obs_dbz[cf] = np.nan
+            v_alias[cf]   = np.nan
+            zdr[cf]  = np.nan
+            kdp_r[cf] = np.nan
+            cc[cf]   = np.nan
+
+        sh = (self.n_az, self.n_gates)
+        az_edges = np.radians(np.linspace(0, 360, self.n_az + 1))
+        r_edges  = np.arange(0, self.n_gates + 1, dtype=np.float32) * self.delta_r_m / 1000.0
+        return dict(
+            refl   = Z_obs_dbz.reshape(sh),
+            vel    = v_alias.reshape(sh),
+            zdr    = zdr.reshape(sh),
+            kdp    = kdp_r.reshape(sh),
+            cc     = cc.reshape(sh),
+            az_edges = az_edges,
+            r_edges  = r_edges,   # km
+            el_deg   = el_deg,
+            v_max    = self.v_max_ms,
+        )
+
+    # ── RHI scan ──────────────────────────────────────────────────────────────
+
+    def scan_rhi(self, ds, t_idx, az_deg):
+        """Return (refl, vel, zdr, kdp, cc, r_km, h_km) arrays for one RHI."""
+        st = self._extract(ds, t_idx)
+        return self._scan_rhi(st, az_deg)
+
+    def _scan_rhi(self, st, az_deg):
+        n_el   = max(2, int(60.0 / max(self.theta_beam_deg, 0.5)))
+        el_arr = np.radians(np.linspace(0.5, 60.0, n_el, dtype=np.float32))
+        gate_r = np.arange(1, self.n_gates + 1, dtype=np.float32) * self.delta_r_m
+        az_rad = float(np.radians(az_deg))
+        sin_az = float(np.sin(az_rad))
+        cos_az = float(np.cos(az_rad))
+
+        gate_x = (self._rx + gate_r * sin_az).astype(np.float32)
+        gate_y = (self._ry + gate_r * cos_az).astype(np.float32)
+
+        # Barnes weights for this fixed azimuth's gates
+        kappa2 = self._dx * self._dx
+        ic0 = np.clip(np.searchsorted(self._xh_m, gate_x.astype(np.float64)) - 1,
+                      0, self._nx - 1).astype(np.int32)
+        ir0 = np.clip(np.searchsorted(self._yh_m, gate_y.astype(np.float64)) - 1,
+                      0, self._ny - 1).astype(np.int32)
+        di  = np.array([-1,-1,-1,0,0,0,1,1,1], dtype=np.int32)
+        dj  = np.array([-1,0,1,-1,0,1,-1,0,1], dtype=np.int32)
+        riy = np.clip(ir0[:,None] + di[None,:], 0, self._ny-1).astype(np.int32)
+        rix = np.clip(ic0[:,None] + dj[None,:], 0, self._nx-1).astype(np.int32)
+        nb_x = self._xh_m[rix]
+        nb_y = self._yh_m[riy]
+        dxn  = gate_x[:,None].astype(np.float64) - nb_x
+        dyn  = gate_y[:,None].astype(np.float64) - nb_y
+        rw   = np.exp(-(dxn*dxn + dyn*dyn).astype(np.float32) / kappa2)
+        rw  /= np.maximum(rw.sum(axis=1, keepdims=True), 1e-10)
+        rw   = rw.astype(np.float32)
+
+        r2d   = gate_r[None, :]          # (1, n_g)
+        el2d  = el_arr[:, None]          # (n_el, 1)
+        h_agl = np.clip(r2d * np.sin(el2d) + r2d**2 / (2 * _RE_EFF),
+                        0.0, None).astype(np.float32)
+
+        Z_LEV   = self._zh_m.astype(np.float32)
+        k_lvl   = np.clip(np.searchsorted(Z_LEV, h_agl) - 1, 0, self._nz-2).astype(np.int32)
+        dz_lyr  = np.maximum(Z_LEV[k_lvl + 1] - Z_LEV[k_lvl], 1.0)
+        alpha_z = np.clip((h_agl - Z_LEV[k_lvl]) / dz_lyr, 0.0, 1.0).astype(np.float32)
+
+        iy3 = riy[None, :, :]; ix3 = rix[None, :, :]; w3 = rw[None, :, :]
+        k3  = k_lvl[:, :, None]; a3 = alpha_z[:, :, None]
+
+        def _s3r(field):
+            lo  = field[k3, iy3, ix3]; hi = field[k3+1, iy3, ix3]
+            return ((1.0 - a3)*lo + a3*hi) * w3
+        def _s3rs(field):
+            return _s3r(field).sum(axis=2).astype(np.float32)
+
+        qr = _s3rs(st['qr']); qc = _s3rs(st['qc']); qi = _s3rs(st['qi'])
+        qs = _s3rs(st['qs']); qg = _s3rs(st['qg']); qh = _s3rs(st['qh'])
+        T  = _s3rs(st['T_K']); rho = _s3rs(st['rho'])
+        u  = _s3rs(st['u']); v = _s3rs(st['v']); w = _s3rs(st['w'])
+        tke = _s3rs(st['tke'])
+
+        Z_true, R, disorder = self._compute_Z(qr, qs, qg, qh, qc, T, rho)
+
+        bd = _RBAND[self.band]
+        a_att, b_att = bd['attn']
+        a_kdp, b_kdp = bd['kdp']
+        alpha_dBkm   = (a_att * Z_true**b_att).astype(np.float32)
+        A_cum  = np.concatenate([np.zeros((n_el, 1), np.float32),
+                                 np.cumsum(2.0 * alpha_dBkm * (self.delta_r_m / 1000.0),
+                                           axis=1)[:, :-1]], axis=1)
+        Z_obs_dbz = 10.0 * np.log10(Z_true) - A_cum
+
+        kdp_r   = np.where(R > 0, a_kdp * R**b_kdp, 0.0).astype(np.float32)
+        zdr, cc = self._compute_pol(qr, qs, qi, qg, qh, R, Z_true, disorder)
+
+        Z_min_r = self.z_min_ref_dbz + 20.0*np.log10(np.maximum(gate_r / 10e3, 1e-6))
+        below   = Z_obs_dbz < Z_min_r[None, :]
+        Z_obs_dbz[below] = np.nan
+        zdr[below]  = np.nan
+        kdp_r[below] = np.nan
+        cc[below]   = np.nan
+
+        cos_el_2d = np.cos(el2d); sin_el_2d = np.sin(el2d)
+        v_r     = u*sin_az*cos_el_2d + v*cos_az*cos_el_2d + w*sin_el_2d
+        sigma_v = np.sqrt(np.maximum(2.0/3.0 * tke, 0.0))
+        T_s     = 1.0 / self.prf_hz
+        var_v   = sigma_v * self.lam_m / (8.0 * self.n_samples * T_s * np.sqrt(np.pi))
+        std_v   = np.sqrt(np.maximum(var_v, 0.0)).astype(np.float32)
+        v_r_obs = v_r + np.random.normal(0.0, 1.0, size=v_r.shape).astype(np.float32) * std_v
+        v_alias = ((v_r_obs + self.v_max_ms) % (2.0*self.v_max_ms)) - self.v_max_ms
+        v_alias[below] = np.nan
+
+        if self.clutter_filter:
+            cf = (np.abs(v_r) < self.v_notch_ms) & ~below
+            Z_obs_dbz[cf] = np.nan; v_alias[cf] = np.nan
+            zdr[cf]  = np.nan; kdp_r[cf] = np.nan; cc[cf] = np.nan
+
+        return dict(
+            refl     = Z_obs_dbz.astype(np.float32),
+            vel      = v_alias.astype(np.float32),
+            zdr      = zdr,
+            kdp      = kdp_r,
+            cc       = cc,
+            r_km     = gate_r / 1000.0,
+            h_km     = h_agl,   # (n_el, n_gates) in m → convert on display
+            az_deg   = az_deg,
+            v_max    = self.v_max_ms,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -227,6 +656,20 @@ class CM1Viewer(tk.Tk):
         self.v_gif_t0     = tk.StringVar(value='0')
         self.v_gif_t1     = tk.StringVar(value='')
         self.v_live       = tk.BooleanVar(value=True)
+        # radar
+        self.v_radar_band     = tk.StringVar(value='S')
+        self.v_radar_dish     = tk.DoubleVar(value=4.2)
+        self.v_radar_power    = tk.DoubleVar(value=250.0)
+        self.v_radar_prf      = tk.DoubleVar(value=1000.0)
+        self.v_radar_pulse    = tk.DoubleVar(value=1.0)
+        self.v_radar_clutter  = tk.BooleanVar(value=False)
+        self.v_radar_el       = tk.DoubleVar(value=0.5)
+        self.v_radar_az       = tk.DoubleVar(value=0.0)
+        self.v_radar_product  = tk.StringVar(value='refl')
+        self._radar_loc       = None   # (x_km, y_km) or None
+        self._radar_obj       = None   # CM1Radar instance
+        self._radar_mode      = False  # placement click mode
+        self._radar_win       = None   # RadarWindow Toplevel
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
@@ -493,6 +936,78 @@ class CM1Viewer(tk.Tk):
         ttk.Checkbutton(ctrf, text="Symmetric", variable=self.v_ctr_sym,
                         command=self._on_ctr_sym).pack(anchor='w', padx=6, pady=(0, 6))
 
+        # Virtual radar
+        self._build_radar_panel(parent)
+
+    def _build_radar_panel(self, parent):
+        rf = ttk.LabelFrame(parent, text="Virtual Radar")
+        rf.pack(fill='x', padx=6, pady=4)
+
+        # Placement
+        self._radar_lbl = ttk.Label(rf, text="No radar placed", foreground='gray',
+                                    font=('Courier', 9))
+        self._radar_lbl.pack(anchor='w', padx=6, pady=(4, 0))
+        self._radar_btn = ttk.Button(rf, text="Place Radar (click plan view)",
+                                     command=self._toggle_radar_mode)
+        self._radar_btn.pack(fill='x', padx=6, pady=2)
+
+        # Hardware
+        hw = ttk.LabelFrame(rf, text="Hardware")
+        hw.pack(fill='x', padx=6, pady=2)
+        r1 = ttk.Frame(hw); r1.pack(fill='x', padx=4, pady=2)
+        ttk.Label(r1, text="Band:").pack(side='left')
+        for b in ('S', 'C', 'X', 'Ka'):
+            ttk.Radiobutton(r1, text=b, variable=self.v_radar_band,
+                            value=b).pack(side='left', padx=2)
+        r2a = ttk.Frame(hw); r2a.pack(fill='x', padx=4, pady=(2, 0))
+        ttk.Label(r2a, text="Dish (m):").pack(side='left')
+        ttk.Spinbox(r2a, from_=0.5, to=10.0, increment=0.1,
+                    textvariable=self.v_radar_dish, width=6).pack(side='left', padx=4)
+        r2b = ttk.Frame(hw); r2b.pack(fill='x', padx=4, pady=(0, 2))
+        ttk.Label(r2b, text="Power (kW):").pack(side='left')
+        ttk.Spinbox(r2b, from_=1, to=1000, increment=10,
+                    textvariable=self.v_radar_power, width=6).pack(side='left', padx=4)
+
+        # Operational
+        op = ttk.LabelFrame(rf, text="Operational")
+        op.pack(fill='x', padx=6, pady=2)
+        r3a = ttk.Frame(op); r3a.pack(fill='x', padx=4, pady=(2, 0))
+        ttk.Label(r3a, text="PRF (Hz):").pack(side='left')
+        ttk.Spinbox(r3a, from_=100, to=4000, increment=100,
+                    textvariable=self.v_radar_prf, width=7).pack(side='left', padx=4)
+        r3b = ttk.Frame(op); r3b.pack(fill='x', padx=4, pady=(0, 2))
+        ttk.Label(r3b, text="Pulse (µs):").pack(side='left')
+        ttk.Spinbox(r3b, from_=0.1, to=100.0, increment=0.5,
+                    textvariable=self.v_radar_pulse, width=6).pack(side='left', padx=4)
+        ttk.Checkbutton(op, text="Clutter filter", variable=self.v_radar_clutter
+                        ).pack(anchor='w', padx=4, pady=(0, 2))
+
+        # Scan
+        sc = ttk.LabelFrame(rf, text="Scan")
+        sc.pack(fill='x', padx=6, pady=2)
+        r4 = ttk.Frame(sc); r4.pack(fill='x', padx=4, pady=2)
+        ttk.Label(r4, text="PPI El (°):").pack(side='left')
+        ttk.Spinbox(r4, from_=0.1, to=89.0, increment=0.5,
+                    textvariable=self.v_radar_el, width=6).pack(side='left', padx=4)
+        ttk.Button(r4, text="Scan PPI",
+                   command=lambda: self._do_radar_scan('ppi')).pack(side='right', padx=4)
+        r5 = ttk.Frame(sc); r5.pack(fill='x', padx=4, pady=2)
+        ttk.Label(r5, text="RHI Az (°):").pack(side='left')
+        ttk.Spinbox(r5, from_=0.0, to=359.9, increment=1.0,
+                    textvariable=self.v_radar_az, width=6).pack(side='left', padx=4)
+        ttk.Button(r5, text="Scan RHI",
+                   command=lambda: self._do_radar_scan('rhi')).pack(side='right', padx=4)
+
+        # Product
+        pr = ttk.LabelFrame(rf, text="Product")
+        pr.pack(fill='x', padx=6, pady=(2, 6))
+        _prow = ttk.Frame(pr); _prow.pack(fill='x', padx=4, pady=2)
+        for pname, plbl in [('refl','Z  (dBZ)'), ('vel','Vr (m/s)'),
+                             ('zdr','ZDR (dB)'), ('kdp','KDP (°/km)'), ('cc','CC')]:
+            ttk.Radiobutton(_prow, text=plbl, variable=self.v_radar_product,
+                            value=pname,
+                            command=self._redisplay_radar).pack(anchor='w')
+
     def _build_time_bar(self, parent):
         # Playback row
         pb = ttk.Frame(parent)
@@ -543,6 +1058,102 @@ class CM1Viewer(tk.Tk):
         self._gif_progress = ttk.Label(sv, text="", foreground='#226')
         self._gif_progress.pack(side='left', padx=4)
 
+    # ── radar ─────────────────────────────────────────────────────────────────
+
+    def _toggle_radar_mode(self):
+        if self._ds is None:
+            messagebox.showwarning("No data", "Open a file first.")
+            return
+        self._radar_mode = not self._radar_mode
+        if self._radar_mode:
+            self._radar_btn.config(text="Cancel placement")
+            self._canvas.get_tk_widget().config(cursor='crosshair')
+            if self._mpl_cid is None:
+                self._mpl_cid = self._canvas.mpl_connect(
+                    'button_press_event', self._on_canvas_click)
+        else:
+            self._radar_btn.config(text="Place Radar (click plan view)")
+            self._canvas.get_tk_widget().config(cursor='')
+
+    def _on_canvas_click(self, event):
+        if event.inaxes != self._ax or event.button != 1:
+            return
+        if self._sounding_mode:
+            self._sounding_mode = False
+            self._snd_btn.config(text="Take Sounding")
+            self._canvas.get_tk_widget().config(cursor='')
+            self._take_sounding(event.xdata, event.ydata)
+        elif self._radar_mode:
+            self._radar_mode = False
+            self._radar_btn.config(text="Place Radar (click plan view)")
+            self._canvas.get_tk_widget().config(cursor='')
+            if self._ds is None or event.xdata is None or event.ydata is None:
+                return
+            self._radar_loc = (event.xdata, event.ydata)
+            self._radar_lbl.config(
+                text=f"Radar @ ({event.xdata:.1f}, {event.ydata:.1f}) km",
+                foreground='black')
+            self._radar_obj = None
+
+    def _build_radar_obj(self):
+        """(Re)create CM1Radar if location or config changed."""
+        if self._radar_loc is None or self._ds is None:
+            return None
+        cfg = dict(
+            band        = self.v_radar_band.get(),
+            dish_m      = self.v_radar_dish.get(),
+            power_kw    = self.v_radar_power.get(),
+            prf_hz      = self.v_radar_prf.get(),
+            pulse_us    = self.v_radar_pulse.get(),
+            clutter_filter = self.v_radar_clutter.get(),
+        )
+        x_km, y_km = self._radar_loc
+        return CM1Radar(x_km, y_km, cfg, self._ds)
+
+    def _do_radar_scan(self, mode):
+        if self._ds is None:
+            messagebox.showwarning("No data", "Open a file first.")
+            return
+        if self._radar_loc is None:
+            messagebox.showwarning("No radar", "Place a radar first (click plan view).")
+            return
+        radar = self._build_radar_obj()
+        if radar is None:
+            return
+        self._radar_obj = radar
+
+        import threading
+        self._gif_progress.config(text=f"Scanning {mode.upper()}…")
+        self.update_idletasks()
+
+        def _run():
+            try:
+                if mode == 'ppi':
+                    result = radar.scan_ppi(self._ds, self._t_idx,
+                                            self.v_radar_el.get())
+                else:
+                    result = radar.scan_rhi(self._ds, self._t_idx,
+                                            self.v_radar_az.get())
+                self.after(0, lambda: self._show_radar(result, mode))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror("Radar error", str(e)))
+            finally:
+                self.after(0, lambda: self._gif_progress.config(text=""))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _show_radar(self, result, mode):
+        """Open or update the RadarWindow with the latest scan."""
+        if self._radar_win is None or not self._radar_win.winfo_exists():
+            self._radar_win = RadarWindow(self)
+        self._radar_win.update_scan(result, mode, self.v_radar_product.get(),
+                                    self._radar_loc)
+
+    def _redisplay_radar(self):
+        """Re-render current scan with new product selection."""
+        if self._radar_win is not None and self._radar_win.winfo_exists():
+            self._radar_win.replot(self.v_radar_product.get())
+
     # ── sounding ─────────────────────────────────────────────────────────────
 
     def _toggle_sounding_mode(self):
@@ -551,21 +1162,13 @@ class CM1Viewer(tk.Tk):
             return
         self._sounding_mode = not self._sounding_mode
         if self._sounding_mode:
+            self._radar_mode = False   # cancel radar placement if active
+            self._radar_btn.config(text="Place Radar (click plan view)")
             self._snd_btn.config(text="Cancel Sounding")
             self._canvas.get_tk_widget().config(cursor='crosshair')
         else:
             self._snd_btn.config(text="Take Sounding")
             self._canvas.get_tk_widget().config(cursor='')
-
-    def _on_canvas_click(self, event):
-        if not self._sounding_mode or event.inaxes != self._ax:
-            return
-        if event.button != 1:
-            return
-        self._sounding_mode = False
-        self._snd_btn.config(text="Take Sounding")
-        self._canvas.get_tk_widget().config(cursor='')
-        self._take_sounding(event.xdata, event.ydata)
 
     def _take_sounding(self, cx, cy):
         try:
@@ -1007,17 +1610,30 @@ class CM1Viewer(tk.Tk):
 
         if not is_3d:
             # 2-D surface field: data is (ny, nx)
-            plot_data = data
-            vmin, vmax = self._get_range(plot_data)
-            im = ax.pcolormesh(xh, yh, plot_data,
-                               cmap=cmap, norm=Normalize(vmin, vmax),
-                               shading='nearest')
-            self._add_colorbar(im, field)
-            ax.set_xlabel('x  (km)')
-            ax.set_ylabel('y  (km)')
-            ax.set_title(
-                f"{field}  —  t = {t_str}  [{self._ds.get_units(field)}]",
-                fontsize=10)
+            try:
+                plot_data = data
+                vmin, vmax = self._get_range(plot_data)
+                im = ax.pcolormesh(xh, yh, plot_data,
+                                   cmap=cmap, norm=Normalize(vmin, vmax),
+                                   shading='nearest')
+                self._add_colorbar(im, field)
+                ax.set_xlabel('x  (km)')
+                ax.set_ylabel('y  (km)')
+                ax.set_title(
+                    f"{field}  —  t = {t_str}  [{self._ds.get_units(field)}]",
+                    fontsize=10)
+                xlim = self._get_lims(self.v_xmin, self.v_xmax, self.v_xlim_sym,
+                                      np.array(ax.get_xlim()))
+                ylim = self._get_lims(self.v_ymin, self.v_ymax, self.v_ylim_sym,
+                                      np.array(ax.get_ylim()))
+                if xlim[0] is not None:
+                    ax.set_xlim(xlim)
+                if ylim[0] is not None:
+                    ax.set_ylim(ylim)
+            except Exception as e:
+                ax.text(0.5, 0.5, f"Error plotting 2D field:\n{e}",
+                        ha='center', va='center',
+                        transform=ax.transAxes, color='red')
             self._canvas.draw_idle()
             return
 
@@ -1300,6 +1916,236 @@ class CM1Viewer(tk.Tk):
         base = os.path.basename(path)
         self.after(0, lambda: self._gif_progress.config(
             text=f"Saved {n} frames → {base}"))
+
+
+# ---------------------------------------------------------------------------
+# Radar display window
+# ---------------------------------------------------------------------------
+
+# Weather colormaps via pyart (registers under 'pyart_*' names); fall back gracefully
+try:
+    import pyart  # noqa: F401  — side-effect: registers colormaps in matplotlib
+    _CMAP_SPECTRAL = 'ChaseSpectral'
+    _CMAP_VEL      = 'Carbone42'
+except ImportError:
+    _CMAP_SPECTRAL = 'gist_ncar'
+    _CMAP_VEL      = 'RdBu_r'
+
+
+class RadarWindow(tk.Toplevel):
+    """Popup showing the latest radar scan.
+
+    PPI: native polar projection axes (no Cartesian regridding).
+    RHI: range–height axes using 2-D coordinate pcolormesh.
+    """
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Virtual Radar")
+        self.minsize(620, 600)
+        self._result    = None
+        self._mode      = None
+        self._radar_loc = None
+
+        self._PCFG = {
+            'refl': dict(label='Z  (dBZ)',     cmap=_CMAP_SPECTRAL, vmin=-10,  vmax=75),
+            'vel':  dict(label='Vr  (m/s)',    cmap=_CMAP_VEL,      vmin=None, vmax=None),
+            'zdr':  dict(label='ZDR  (dB)',    cmap=_CMAP_SPECTRAL, vmin=-1,   vmax=8),
+            'kdp':  dict(label='KDP  (°/km)', cmap=_CMAP_SPECTRAL, vmin=0,    vmax=6),
+            'cc':   dict(label='CC',           cmap=_CMAP_SPECTRAL, vmin=0.5,  vmax=1.0),
+        }
+
+        self._info_lbl = ttk.Label(self, text="", font=('Courier', 9))
+        self._info_lbl.pack(fill='x', padx=6, pady=(4, 0))
+
+        # Product selector
+        self._current_product = 'refl'
+        self._v_product = tk.StringVar(value='refl')
+        _pr = ttk.Frame(self)
+        _pr.pack(fill='x', padx=6, pady=(2, 0))
+        for pname, plbl in [('refl', 'Z'), ('vel', 'Vr'), ('zdr', 'ZDR'),
+                             ('kdp', 'KDP'), ('cc', 'CC')]:
+            ttk.Radiobutton(_pr, text=plbl, variable=self._v_product, value=pname,
+                            command=self._on_product_change).pack(side='left', padx=4)
+
+        # Colorbar range controls
+        _cr = ttk.Frame(self)
+        _cr.pack(fill='x', padx=6, pady=(2, 0))
+        ttk.Label(_cr, text="vmin:").pack(side='left')
+        self._v_vmin = tk.StringVar(value='')
+        self._v_vmax = tk.StringVar(value='')
+        _emin = ttk.Entry(_cr, textvariable=self._v_vmin, width=7)
+        _emin.pack(side='left', padx=(2, 6))
+        ttk.Label(_cr, text="vmax:").pack(side='left')
+        _emax = ttk.Entry(_cr, textvariable=self._v_vmax, width=7)
+        _emax.pack(side='left', padx=(2, 6))
+        ttk.Button(_cr, text="Apply", command=self._on_apply_limits).pack(side='left', padx=2)
+        ttk.Button(_cr, text="Reset", command=self._on_reset_limits).pack(side='left', padx=2)
+        _emin.bind('<Return>', lambda _: self._on_apply_limits())
+        _emax.bind('<Return>', lambda _: self._on_apply_limits())
+
+        self._fig    = Figure(figsize=(6.2, 5.4), dpi=100)
+        self._ax     = None
+        self._cax    = None
+        self._cbar   = None
+        self._canvas = FigureCanvasTkAgg(self._fig, master=self)
+        self._canvas.get_tk_widget().pack(fill='both', expand=True)
+        NavigationToolbar2Tk(self._canvas, self, pack_toolbar=False).pack(fill='x')
+
+    # ── public API ─────────────────────────────────────────────────────────────
+
+    def update_scan(self, result, mode, product, radar_loc):
+        self._result    = result
+        self._mode      = mode
+        self._radar_loc = radar_loc
+        self.replot(product)
+        self.lift()
+
+    def replot(self, product):
+        if self._result is None:
+            return
+        result = self._result
+        mode   = self._mode
+        loc    = self._radar_loc
+        pcfg   = self._PCFG.get(product, self._PCFG['refl'])
+
+        data = result.get(product)
+        if data is None:
+            return
+
+        # Track product; clear manual limits and sync radio button on change
+        if product != self._current_product:
+            self._current_product = product
+            self._v_product.set(product)
+            self._v_vmin.set('')
+            self._v_vmax.set('')
+
+        is_ppi = (mode == 'ppi')
+        self._reset_figure(is_ppi)
+
+        # Default limits
+        vmin, vmax = pcfg['vmin'], pcfg['vmax']
+        if product == 'vel':
+            vm   = float(result.get('v_max', 30.0))
+            vmin, vmax = -vm, vm
+        # Override with user entries if set
+        try:    vmin = float(self._v_vmin.get())
+        except ValueError: pass
+        try:    vmax = float(self._v_vmax.get())
+        except ValueError: pass
+        norm = Normalize(vmin=vmin, vmax=vmax)
+
+        finite = data[np.isfinite(data)]
+        if len(finite) == 0:
+            self._ax.text(0.5, 0.5, "No signal above noise floor",
+                          ha='center', va='center',
+                          transform=self._ax.transAxes, color='gray')
+            self._canvas.draw_idle()
+            return
+
+        im = self._draw_ppi(result, data, norm, pcfg, loc) if is_ppi \
+             else self._draw_rhi(result, data, norm, pcfg, loc)
+
+        if im is not None:
+            if self._cbar is None:
+                self._cbar = self._fig.colorbar(im, cax=self._cax)
+            else:
+                self._cbar.update_normal(im)
+            self._cbar.set_label(pcfg['label'], fontsize=9)
+
+        self._canvas.draw_idle()
+
+    def _on_product_change(self):
+        self.replot(self._v_product.get())
+
+    def _on_apply_limits(self):
+        self.replot(self._current_product)
+
+    def _on_reset_limits(self):
+        self._v_vmin.set('')
+        self._v_vmax.set('')
+        self.replot(self._current_product)
+
+    # ── private helpers ────────────────────────────────────────────────────────
+
+    def _reset_figure(self, polar):
+        self._fig.clf()
+        self._cbar = None
+        if polar:
+            self._ax  = self._fig.add_axes([0.06, 0.05, 0.80, 0.88],
+                                            projection='polar')
+        else:
+            self._ax  = self._fig.add_axes([0.10, 0.08, 0.74, 0.84])
+        self._cax = self._fig.add_axes([0.89, 0.08, 0.025, 0.84])
+
+    def _draw_ppi(self, result, data, norm, pcfg, loc):
+        # az_edges: (n_az+1,) radians, meteorological convention (0=N, CW)
+        # r_edges:  (n_gates+1,) km
+        # data:     (n_az, n_gates)
+        az_edges = result['az_edges']
+        r_edges  = result['r_edges']
+        ax = self._ax
+        ax.set_theta_zero_location('N')
+        ax.set_theta_direction(-1)
+        # pcolormesh(X, Y, C) expects C.shape == (len(Y)-1, len(X)-1)
+        # X=az (cols), Y=r (rows) → need data transposed to (n_gates, n_az)
+        im = ax.pcolormesh(az_edges, r_edges, data.T,
+                           cmap=pcfg['cmap'], norm=norm, shading='flat')
+        el      = result.get('el_deg', 0.0)
+        vm      = result.get('v_max', 30.0)
+        loc_str = f"({loc[0]:.1f}, {loc[1]:.1f}) km" if loc else "?"
+        ax.set_title(f"PPI  El={el:.1f}°   Radar @ {loc_str}", pad=14, fontsize=10)
+        self._info_lbl.config(
+            text=f"PPI  El={el:.1f}°   Vmax=±{vm:.0f} m/s   Rmax={r_edges[-1]:.1f} km")
+        return im
+
+    def _draw_rhi(self, result, data, norm, pcfg, loc):
+        r_km = result['r_km']           # (n_gates,)
+        h_km = result['h_km'] / 1000.0  # (n_el, n_gates) m → km
+        n_el, n_g = data.shape
+        ax = self._ax
+
+        # Range edges (1-D)
+        if n_g > 1:
+            r_e = np.empty(n_g + 1, dtype=np.float32)
+            r_e[0]    = r_km[0] - (r_km[1] - r_km[0]) / 2.0
+            r_e[1:-1] = (r_km[:-1] + r_km[1:]) / 2.0
+            r_e[-1]   = r_km[-1] + (r_km[-1] - r_km[-2]) / 2.0
+        else:
+            r_e = np.array([0.0, float(r_km[0])], dtype=np.float32)
+
+        # Height edges (n_el+1, n_g) — one edge per elevation boundary
+        if n_el > 1:
+            dh  = np.diff(h_km, axis=0)
+            h_e = np.vstack([h_km[0:1]  - dh[0:1]  / 2.0,
+                             (h_km[:-1] + h_km[1:]) / 2.0,
+                              h_km[-1:] + dh[-1:]  / 2.0])
+        else:
+            h_e = np.vstack([np.zeros((1, n_g), dtype=np.float32), h_km])
+
+        # Expand height edges to (n_el+1, n_g+1) for pcolormesh
+        h_e2             = np.empty((n_el + 1, n_g + 1), dtype=np.float32)
+        h_e2[:, 0]       = h_e[:, 0]
+        h_e2[:, 1:-1]    = (h_e[:, :-1] + h_e[:, 1:]) / 2.0
+        h_e2[:, -1]      = h_e[:, -1]
+        r_e2             = np.tile(r_e, (n_el + 1, 1))   # (n_el+1, n_g+1)
+
+        im = ax.pcolormesh(r_e2, h_e2, data,
+                           cmap=pcfg['cmap'], norm=norm, shading='flat')
+        ax.set_xlabel('Range  (km)')
+        ax.set_ylabel('Height  (km)')
+        # Cap y-axis using reflectivity extent so all products share the same ylim
+        refl = result.get('refl', data)
+        valid = np.isfinite(refl)
+        h_top = float(h_km[valid].max()) * 1.1 if valid.any() else float(h_km.max())
+        ax.set_ylim(0, h_top)
+        az      = result.get('az_deg', 0.0)
+        vm      = result.get('v_max', 30.0)
+        loc_str = f"({loc[0]:.1f}, {loc[1]:.1f}) km" if loc else "?"
+        ax.set_title(f"RHI  Az={az:.1f}°   Radar @ {loc_str}", fontsize=10)
+        self._info_lbl.config(
+            text=f"RHI  Az={az:.1f}°   Vmax=±{vm:.0f} m/s   Rmax={r_km[-1]:.1f} km")
+        return im
 
 
 # ---------------------------------------------------------------------------
