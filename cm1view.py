@@ -457,12 +457,22 @@ class CM1Radar:
         sh = (self.n_az, self.n_gates)
         az_edges = np.radians(np.linspace(0, 360, self.n_az + 1))
         r_edges  = np.arange(0, self.n_gates + 1, dtype=np.float32) * self.delta_r_m / 1000.0
+        vel_2d   = v_alias.reshape(sh)
+        _vf      = np.where(np.isfinite(vel_2d), vel_2d, 0.0)
+        # Circulation: azimuthal Vr shear × gate area = ΔVr × Δr (r·Δφ cancels)
+        circ = (np.gradient(_vf, axis=0) * self.delta_r_m).astype(np.float32)
+        circ[~np.isfinite(vel_2d)] = np.nan
+        # Radial convergence: -∂Vr/∂r (positive = converging toward radar)
+        conv = (-np.gradient(_vf, self.delta_r_m, axis=1)).astype(np.float32)
+        conv[~np.isfinite(vel_2d)] = np.nan
         return dict(
             refl   = Z_obs_dbz.reshape(sh),
-            vel    = v_alias.reshape(sh),
+            vel    = vel_2d,
             zdr    = zdr.reshape(sh),
             kdp    = kdp_r.reshape(sh),
             cc     = cc.reshape(sh),
+            circ   = circ,
+            conv   = conv,
             az_edges = az_edges,
             r_edges  = r_edges,   # km
             el_deg   = el_deg,
@@ -566,12 +576,22 @@ class CM1Radar:
             Z_obs_dbz[cf] = np.nan; v_alias[cf] = np.nan
             zdr[cf]  = np.nan; kdp_r[cf] = np.nan; cc[cf] = np.nan
 
+        vel_2d = v_alias.astype(np.float32)
+        _vf    = np.where(np.isfinite(vel_2d), vel_2d, 0.0)
+        # Circulation: elevation Vr shear × gate area = ΔVr × Δr (r·Δel cancels)
+        circ = (np.gradient(_vf, axis=0) * self.delta_r_m).astype(np.float32)
+        circ[~np.isfinite(vel_2d)] = np.nan
+        # Radial convergence: -∂Vr/∂r (positive = converging toward radar)
+        conv = (-np.gradient(_vf, self.delta_r_m, axis=1)).astype(np.float32)
+        conv[~np.isfinite(vel_2d)] = np.nan
         return dict(
             refl     = Z_obs_dbz.astype(np.float32),
-            vel      = v_alias.astype(np.float32),
+            vel      = vel_2d,
             zdr      = zdr,
             kdp      = kdp_r,
             cc       = cc,
+            circ     = circ,
+            conv     = conv,
             r_km     = gate_r / 1000.0,
             h_km     = h_agl,   # (n_el, n_gates) in m → convert on display
             az_deg   = az_deg,
@@ -1948,11 +1968,13 @@ class RadarWindow(tk.Toplevel):
         self._radar_loc = None
 
         self._PCFG = {
-            'refl': dict(label='Z  (dBZ)',     cmap=_CMAP_SPECTRAL, vmin=-10,  vmax=75),
-            'vel':  dict(label='Vr  (m/s)',    cmap=_CMAP_VEL,      vmin=None, vmax=None),
-            'zdr':  dict(label='ZDR  (dB)',    cmap=_CMAP_SPECTRAL, vmin=-1,   vmax=8),
-            'kdp':  dict(label='KDP  (°/km)', cmap=_CMAP_SPECTRAL, vmin=0,    vmax=6),
-            'cc':   dict(label='CC',           cmap=_CMAP_SPECTRAL, vmin=0.5,  vmax=1.0),
+            'refl': dict(label='Z  (dBZ)',      cmap=_CMAP_SPECTRAL, vmin=-10,   vmax=75),
+            'vel':  dict(label='Vr  (m/s)',     cmap=_CMAP_VEL,      vmin=None,  vmax=None),
+            'zdr':  dict(label='ZDR  (dB)',     cmap=_CMAP_SPECTRAL, vmin=-1,    vmax=8),
+            'kdp':  dict(label='KDP  (°/km)',  cmap=_CMAP_SPECTRAL, vmin=0,     vmax=6),
+            'cc':   dict(label='CC',            cmap=_CMAP_SPECTRAL, vmin=0.5,   vmax=1.0),
+            'circ': dict(label='Circ  (m²/s)', cmap='RdBu_r',       vmin=-2000, vmax=2000),
+            'conv': dict(label='Conv  (s⁻¹)',  cmap='RdBu_r',       vmin=-0.02, vmax=0.02),
         }
 
         self._info_lbl = ttk.Label(self, text="", font=('Courier', 9))
@@ -1964,7 +1986,7 @@ class RadarWindow(tk.Toplevel):
         _pr = ttk.Frame(self)
         _pr.pack(fill='x', padx=6, pady=(2, 0))
         for pname, plbl in [('refl', 'Z'), ('vel', 'Vr'), ('zdr', 'ZDR'),
-                             ('kdp', 'KDP'), ('cc', 'CC')]:
+                             ('kdp', 'KDP'), ('cc', 'CC'), ('circ', 'Circ'), ('conv', 'Conv')]:
             ttk.Radiobutton(_pr, text=plbl, variable=self._v_product, value=pname,
                             command=self._on_product_change).pack(side='left', padx=4)
 
@@ -1981,8 +2003,23 @@ class RadarWindow(tk.Toplevel):
         _emax.pack(side='left', padx=(2, 6))
         ttk.Button(_cr, text="Apply", command=self._on_apply_limits).pack(side='left', padx=2)
         ttk.Button(_cr, text="Reset", command=self._on_reset_limits).pack(side='left', padx=2)
+        self._v_symmetric = tk.BooleanVar(value=False)
+        ttk.Checkbutton(_cr, text="Sym", variable=self._v_symmetric,
+                        command=self._on_apply_limits).pack(side='left', padx=6)
         _emin.bind('<Return>', lambda _: self._on_apply_limits())
         _emax.bind('<Return>', lambda _: self._on_apply_limits())
+
+        # Range zoom slider
+        _rz = ttk.Frame(self)
+        _rz.pack(fill='x', padx=6, pady=(2, 4))
+        ttk.Label(_rz, text="Range:").pack(side='left')
+        self._v_r_zoom = tk.DoubleVar(value=200.0)
+        self._r_zoom_lbl = ttk.Label(_rz, text="200 km", width=8)
+        self._r_zoom_slider = ttk.Scale(_rz, from_=5, to=200, orient='horizontal',
+                                        variable=self._v_r_zoom,
+                                        command=self._on_r_zoom)
+        self._r_zoom_slider.pack(side='left', fill='x', expand=True, padx=4)
+        self._r_zoom_lbl.pack(side='left')
 
         self._fig    = Figure(figsize=(6.2, 5.4), dpi=100)
         self._ax     = None
@@ -1998,6 +2035,18 @@ class RadarWindow(tk.Toplevel):
         self._result    = result
         self._mode      = mode
         self._radar_loc = radar_loc
+        # Set slider range to match this scan's maximum range
+        r_edges  = result.get('r_edges')
+        r_km_arr = result.get('r_km')
+        if r_edges is not None:
+            r_max = float(r_edges[-1])
+        elif r_km_arr is not None:
+            r_max = float(r_km_arr[-1])
+        else:
+            r_max = 200.0
+        self._r_zoom_slider.configure(to=max(r_max, 5.0))
+        self._v_r_zoom.set(r_max)
+        self._r_zoom_lbl.config(text=f"{r_max:.0f} km")
         self.replot(product)
         self.lift()
 
@@ -2033,6 +2082,10 @@ class RadarWindow(tk.Toplevel):
         except ValueError: pass
         try:    vmax = float(self._v_vmax.get())
         except ValueError: pass
+        # Symmetrize: |vmin| == |vmax| == max of the two
+        if self._v_symmetric.get() and vmin is not None and vmax is not None:
+            val  = max(abs(vmin), abs(vmax))
+            vmin, vmax = -val, val
         norm = Normalize(vmin=vmin, vmax=vmax)
 
         finite = data[np.isfinite(data)]
@@ -2066,6 +2119,11 @@ class RadarWindow(tk.Toplevel):
         self._v_vmax.set('')
         self.replot(self._current_product)
 
+    def _on_r_zoom(self, _=None):
+        km = round(self._v_r_zoom.get())
+        self._r_zoom_lbl.config(text=f"{km} km")
+        self.replot(self._current_product)
+
     # ── private helpers ────────────────────────────────────────────────────────
 
     def _reset_figure(self, polar):
@@ -2091,12 +2149,14 @@ class RadarWindow(tk.Toplevel):
         # X=az (cols), Y=r (rows) → need data transposed to (n_gates, n_az)
         im = ax.pcolormesh(az_edges, r_edges, data.T,
                            cmap=pcfg['cmap'], norm=norm, shading='flat')
+        r_zoom = min(round(self._v_r_zoom.get()), float(r_edges[-1]))
+        ax.set_rmax(r_zoom)
         el      = result.get('el_deg', 0.0)
         vm      = result.get('v_max', 30.0)
         loc_str = f"({loc[0]:.1f}, {loc[1]:.1f}) km" if loc else "?"
         ax.set_title(f"PPI  El={el:.1f}°   Radar @ {loc_str}", pad=14, fontsize=10)
         self._info_lbl.config(
-            text=f"PPI  El={el:.1f}°   Vmax=±{vm:.0f} m/s   Rmax={r_edges[-1]:.1f} km")
+            text=f"PPI  El={el:.1f}°   Vmax=±{vm:.0f} m/s   Rmax={r_zoom:.0f} km")
         return im
 
     def _draw_rhi(self, result, data, norm, pcfg, loc):
@@ -2134,17 +2194,24 @@ class RadarWindow(tk.Toplevel):
                            cmap=pcfg['cmap'], norm=norm, shading='flat')
         ax.set_xlabel('Range  (km)')
         ax.set_ylabel('Height  (km)')
+        r_zoom = min(round(self._v_r_zoom.get()), float(r_km[-1]))
+        ax.set_xlim(0, r_zoom)
         # Cap y-axis using reflectivity extent so all products share the same ylim
-        refl = result.get('refl', data)
+        refl  = result.get('refl', data)
         valid = np.isfinite(refl)
-        h_top = float(h_km[valid].max()) * 1.1 if valid.any() else float(h_km.max())
+        # Restrict height max to gates within the zoomed range
+        in_range = r_km <= r_zoom
+        refl_in  = refl[:, in_range] if refl.ndim == 2 else refl
+        valid_in = np.isfinite(refl_in)
+        h_in     = h_km[:, in_range] if h_km.ndim == 2 else h_km
+        h_top = float(h_in[valid_in].max()) * 1.1 if valid_in.any() else float(h_km.max())
         ax.set_ylim(0, h_top)
         az      = result.get('az_deg', 0.0)
         vm      = result.get('v_max', 30.0)
         loc_str = f"({loc[0]:.1f}, {loc[1]:.1f}) km" if loc else "?"
         ax.set_title(f"RHI  Az={az:.1f}°   Radar @ {loc_str}", fontsize=10)
         self._info_lbl.config(
-            text=f"RHI  Az={az:.1f}°   Vmax=±{vm:.0f} m/s   Rmax={r_km[-1]:.1f} km")
+            text=f"RHI  Az={az:.1f}°   Vmax=±{vm:.0f} m/s   Rmax={r_zoom:.0f} km")
         return im
 
 
