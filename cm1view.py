@@ -487,7 +487,7 @@ class CM1Viewer(tk.Tk):
         ttk.Label(_cr, text="/").pack(side='left', padx=4)
         _lim_entry(_cr, self.v_ctr_max, self.v_ctr_min, self.v_ctr_sym, is_max=True).pack(side='left')
         ttk.Checkbutton(ctrf, text="Symmetric", variable=self.v_ctr_sym,
-                        command=self._plot).pack(anchor='w', padx=6, pady=(0, 6))
+                        command=self._on_ctr_sym).pack(anchor='w', padx=6, pady=(0, 6))
 
     def _build_time_bar(self, parent):
         # Playback row
@@ -622,15 +622,13 @@ class CM1Viewer(tk.Tk):
         p_hpa = prs_col / 100.0
         u_ms  = u_col if u_col is not None else np.zeros_like(T_c)
         v_ms  = v_col if v_col is not None else np.zeros_like(T_c)
-        u_kt  = u_ms * 1.94384
-        v_kt  = v_ms * 1.94384
 
         clean_data = {
             'p':  p_hpa * munits('hPa'),
             'T':  T_c   * munits('degC'),
             'Td': Td_c  * munits('degC'),
-            'u':  u_kt  * munits('kt'),
-            'v':  v_kt  * munits('kt'),
+            'u':  u_ms  * munits('m/s'),
+            'v':  v_ms  * munits('m/s'),
             'z':  z_m   * munits('m'),
         }
         t_str = _sec_label(ds.times[t])
@@ -734,7 +732,8 @@ class CM1Viewer(tk.Tk):
         self._cmap_cb['values']  = CMAPS
         if all_fields and not self.v_field.get():
             self.v_field.set(all_fields[0])
-        self.v_ctr_field.set('')
+        if self.v_ctr_field.get() not in all_fields:
+            self.v_ctr_field.set('')
 
         nt = self._ds.ntimes
         self._t_slider.config(to=max(nt - 1, 1))
@@ -742,8 +741,9 @@ class CM1Viewer(tk.Tk):
         self._t_idx = 0
 
         nk = len(self._ds.zh)
+        cur_ki = int(self._z_slider.get())
         self._z_slider.config(to=max(nk - 1, 1))
-        self._z_slider.set(nk // 2)
+        self._z_slider.set(min(cur_ki, nk - 1))
 
         self.v_gif_t1.set(str(int(self._ds.times[-1])) if nt > 0 else '')
         self._plot()
@@ -911,6 +911,18 @@ class CM1Viewer(tk.Tk):
                     self.v_ymax.set(f'{-float(self.v_ymin.get()):.6g}')
                 except ValueError:
                     pass
+        self._plot()
+
+    def _on_ctr_sym(self):
+        if self.v_ctr_sym.get():
+            try:    lo = float(self.v_ctr_min.get())
+            except ValueError: lo = None
+            try:    hi = float(self.v_ctr_max.get())
+            except ValueError: hi = None
+            if lo is not None or hi is not None:
+                amax = max(abs(v) for v in [lo, hi] if v is not None)
+                self.v_ctr_min.set(f'{-amax:.6g}')
+                self.v_ctr_max.set(f'{amax:.6g}')
         self._plot()
 
     def _get_lims(self, v_min, v_max, v_sym, auto_data):
@@ -1127,13 +1139,11 @@ class CM1Viewer(tk.Tk):
                 clo = float(np.nanmin(cslice))
                 chi = float(np.nanmax(cslice))
             else:
-                if sym:
-                    if chi is not None and clo is None:
-                        clo = -chi
-                    elif clo is not None and chi is None:
-                        chi = -clo
                 clo = clo if clo is not None else float(np.nanmin(cslice))
                 chi = chi if chi is not None else float(np.nanmax(cslice))
+            if sym:
+                amax = max(abs(clo), abs(chi))
+                clo, chi = -amax, amax
             levels = np.linspace(clo, chi, nlevs)
 
             if style == 'pn':
