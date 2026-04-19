@@ -141,13 +141,14 @@ class CM1Dataset:
 
     def close(self):
         for ds in self._dsets:
-            ds.close()
+            try:
+                ds.close()
+            except Exception:
+                pass
+        self._dsets.clear()
 
     def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
+        self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +621,51 @@ def _sec_label(s):
     return f"{h:.2f} h"
 
 
+def _copy_figure_to_clipboard(fig):
+    """Render a matplotlib figure as PNG and place it on the system clipboard."""
+    import io, sys, tempfile, os, subprocess
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    png_bytes = buf.getvalue()
+
+    if sys.platform == 'darwin':
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            f.write(png_bytes)
+            tmp = f.name
+        try:
+            subprocess.run(
+                ['osascript', '-e',
+                 f'set the clipboard to (read (POSIX file "{tmp}") as «class PNGf»)'],
+                check=True)
+        finally:
+            os.unlink(tmp)
+
+    elif sys.platform == 'win32':
+        try:
+            import win32clipboard
+            from PIL import Image
+            img = Image.open(io.BytesIO(png_bytes)).convert('RGB')
+            bmp_buf = io.BytesIO()
+            img.save(bmp_buf, 'BMP')
+            dib = bmp_buf.getvalue()[14:]   # strip 14-byte BMP file header → DIB
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32clipboard.CF_DIB, dib)
+            win32clipboard.CloseClipboard()
+        except ImportError:
+            raise RuntimeError("Install pywin32 for clipboard image support on Windows.")
+
+    else:   # Linux / other X11
+        for cmd in (['xclip', '-selection', 'clipboard', '-t', 'image/png'],
+                    ['xsel',  '--clipboard', '--input']):
+            try:
+                subprocess.run(cmd, input=png_bytes, check=True)
+                return
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                pass
+        raise RuntimeError("Install xclip or xsel for clipboard image support on Linux.")
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -1068,6 +1114,8 @@ class CM1Viewer(tk.Tk):
 
         ttk.Button(sv, text="Save PNG",
                    command=self._save_png).pack(side='left', padx=4)
+        ttk.Button(sv, text="Copy PNG",
+                   command=self._copy_to_clipboard).pack(side='left', padx=4)
 
         ttk.Label(sv, text="  Save GIF  t₀ (s):").pack(side='left')
         ttk.Entry(sv, textvariable=self.v_gif_t0, width=8).pack(side='left', padx=2)
@@ -1141,6 +1189,7 @@ class CM1Viewer(tk.Tk):
         if radar is None:
             return
         self._radar_obj = radar
+        scan_angle = self.v_radar_el.get() if mode == 'ppi' else self.v_radar_az.get()
 
         import threading
         self._gif_progress.config(text=f"Scanning {mode.upper()}…")
@@ -1149,25 +1198,25 @@ class CM1Viewer(tk.Tk):
         def _run():
             try:
                 if mode == 'ppi':
-                    result = radar.scan_ppi(self._ds, self._t_idx,
-                                            self.v_radar_el.get())
+                    result = radar.scan_ppi(self._ds, self._t_idx, scan_angle)
                 else:
-                    result = radar.scan_rhi(self._ds, self._t_idx,
-                                            self.v_radar_az.get())
-                self.after(0, lambda: self._show_radar(result, mode))
+                    result = radar.scan_rhi(self._ds, self._t_idx, scan_angle)
+                self.after(0, lambda: self._show_radar(result, mode, radar, scan_angle))
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Radar error", str(e)))
+                self.after(0, lambda e=e: messagebox.showerror("Radar error", str(e)))
             finally:
                 self.after(0, lambda: self._gif_progress.config(text=""))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _show_radar(self, result, mode):
+    def _show_radar(self, result, mode, radar, scan_angle):
         """Open or update the RadarWindow with the latest scan."""
         if self._radar_win is None or not self._radar_win.winfo_exists():
             self._radar_win = RadarWindow(self)
         self._radar_win.update_scan(result, mode, self.v_radar_product.get(),
-                                    self._radar_loc)
+                                    self._radar_loc,
+                                    ds=self._ds, radar=radar,
+                                    scan_angle=scan_angle, t_idx=self._t_idx)
 
     def _redisplay_radar(self):
         """Re-render current scan with new product selection."""
@@ -1885,6 +1934,14 @@ class CM1Viewer(tk.Tk):
             self._fig.savefig(path, dpi=150, bbox_inches='tight')
             self._gif_progress.config(text=f"Saved: {os.path.basename(path)}")
 
+    def _copy_to_clipboard(self):
+        try:
+            _copy_figure_to_clipboard(self._fig)
+            self._gif_progress.config(text="Copied!")
+            self.after(2000, lambda: self._gif_progress.config(text=""))
+        except Exception as e:
+            messagebox.showerror("Clipboard error", str(e))
+
     # ── save GIF ─────────────────────────────────────────────────────────────
 
     def _save_gif(self):
@@ -1973,9 +2030,18 @@ class RadarWindow(tk.Toplevel):
             'zdr':  dict(label='ZDR  (dB)',     cmap=_CMAP_SPECTRAL, vmin=-1,    vmax=8),
             'kdp':  dict(label='KDP  (°/km)',  cmap=_CMAP_SPECTRAL, vmin=0,     vmax=6),
             'cc':   dict(label='CC',            cmap=_CMAP_SPECTRAL, vmin=0.5,   vmax=1.0),
-            'circ': dict(label='Circ  (m²/s)', cmap='RdBu_r',       vmin=-2000, vmax=2000),
+            'circ': dict(label='Circ  (m²/s)', cmap='RdBu_r',       vmin=-500,  vmax=500),
             'conv': dict(label='Conv  (s⁻¹)',  cmap='RdBu_r',       vmin=-0.02, vmax=0.02),
         }
+
+        # Rescan state (populated by update_scan)
+        self._ds          = None
+        self._radar       = None
+        self._scan_angle  = None
+        self._t_idx       = 0
+        self._scanning    = False
+        self._pending_t   = None   # queued t_idx if slider moved during a scan
+        self._rescan_af   = None   # debounce handle
 
         self._info_lbl = ttk.Label(self, text="", font=('Courier', 9))
         self._info_lbl.pack(fill='x', padx=6, pady=(4, 0))
@@ -2021,21 +2087,76 @@ class RadarWindow(tk.Toplevel):
         self._r_zoom_slider.pack(side='left', fill='x', expand=True, padx=4)
         self._r_zoom_lbl.pack(side='left')
 
+        # Angle slider (elevation for PPI, azimuth for RHI)
+        _af = ttk.Frame(self)
+        _af.pack(fill='x', padx=6, pady=(0, 2))
+        self._angle_lbl_name = ttk.Label(_af, text="El (°):", width=7)
+        self._angle_lbl_name.pack(side='left')
+        self._v_angle = tk.DoubleVar(value=0.5)
+        self._angle_val_lbl = ttk.Label(_af, text=" 0.5°", width=7)
+        self._angle_slider = ttk.Scale(_af, from_=0.0, to=20.0, orient='horizontal',
+                                       variable=self._v_angle,
+                                       command=self._on_angle_change)
+        self._angle_slider.pack(side='left', fill='x', expand=True, padx=4)
+        self._angle_val_lbl.pack(side='left')
+
+        # Time navigation row
+        _tf = ttk.Frame(self)
+        _tf.pack(fill='x', padx=6, pady=(0, 4))
+        ttk.Button(_tf, text="◀◀", width=3, command=self._t_first).pack(side='left', padx=2)
+        ttk.Button(_tf, text="◀",  width=3, command=self._t_prev ).pack(side='left', padx=2)
+        ttk.Button(_tf, text="▶",  width=3, command=self._t_next ).pack(side='left', padx=2)
+        ttk.Button(_tf, text="▶▶", width=3, command=self._t_last ).pack(side='left', padx=2)
+        self._t_slider = ttk.Scale(_tf, from_=0, to=0, orient='horizontal',
+                                   command=self._on_t_change)
+        self._t_slider.pack(side='left', fill='x', expand=True, padx=4)
+        self._t_lbl  = ttk.Label(_tf, text="t = —", width=12,
+                                  font=('Courier', 10, 'bold'))
+        self._t_lbl.pack(side='left', padx=4)
+        self._t_busy = ttk.Label(_tf, text="", foreground='#226')
+        self._t_busy.pack(side='left')
+
         self._fig    = Figure(figsize=(6.2, 5.4), dpi=100)
         self._ax     = None
         self._cax    = None
         self._cbar   = None
         self._canvas = FigureCanvasTkAgg(self._fig, master=self)
         self._canvas.get_tk_widget().pack(fill='both', expand=True)
-        NavigationToolbar2Tk(self._canvas, self, pack_toolbar=False).pack(fill='x')
+        _tb_row = ttk.Frame(self)
+        _tb_row.pack(fill='x')
+        NavigationToolbar2Tk(self._canvas, _tb_row, pack_toolbar=False).pack(side='left', fill='x', expand=True)
+        ttk.Button(_tb_row, text="Copy to Clipboard",
+                   command=self._copy_to_clipboard).pack(side='right', padx=6, pady=2)
 
     # ── public API ─────────────────────────────────────────────────────────────
 
-    def update_scan(self, result, mode, product, radar_loc):
+    def update_scan(self, result, mode, product, radar_loc,
+                    ds=None, radar=None, scan_angle=None, t_idx=0):
         self._result    = result
         self._mode      = mode
         self._radar_loc = radar_loc
-        # Set slider range to match this scan's maximum range
+        if ds is not None:
+            self._ds         = ds
+            self._radar      = radar
+            self._scan_angle = scan_angle
+        self._t_idx = t_idx
+        # Sync angle slider to current mode
+        if mode == 'ppi':
+            self._angle_lbl_name.config(text="El (°):")
+            self._angle_slider.configure(from_=0.1, to=20.0)
+        else:
+            self._angle_lbl_name.config(text="Az (°):")
+            self._angle_slider.configure(from_=0.0, to=360.0)
+        if scan_angle is not None:
+            self._v_angle.set(scan_angle)
+            self._angle_val_lbl.config(text=f"{scan_angle:5.1f}°")
+        # Sync time slider
+        if self._ds is not None:
+            nt = self._ds.ntimes
+            self._t_slider.configure(to=max(0, nt - 1))
+            self._t_slider.set(t_idx)
+            self._t_lbl.config(text=f"t = {self._ds.times[t_idx]:.0f} s")
+        # Set range slider to match this scan's maximum range
         r_edges  = result.get('r_edges')
         r_km_arr = result.get('r_km')
         if r_edges is not None:
@@ -2119,10 +2240,107 @@ class RadarWindow(tk.Toplevel):
         self._v_vmax.set('')
         self.replot(self._current_product)
 
+    def _copy_to_clipboard(self):
+        try:
+            _copy_figure_to_clipboard(self._fig)
+            self._t_busy.config(text="Copied!")
+            self.after(2000, lambda: self._t_busy.config(text=""))
+        except Exception as e:
+            messagebox.showerror("Clipboard error", str(e))
+
     def _on_r_zoom(self, _=None):
         km = round(self._v_r_zoom.get())
         self._r_zoom_lbl.config(text=f"{km} km")
         self.replot(self._current_product)
+
+    def _on_angle_change(self, _=None):
+        if self._ds is None:
+            return
+        angle = round(self._v_angle.get(), 1)
+        self._angle_val_lbl.config(text=f"{angle:5.1f}°")
+        if self._rescan_af is not None:
+            self.after_cancel(self._rescan_af)
+        self._rescan_af = self.after(250, lambda: self._rescan(self._t_idx))
+
+    def _on_t_change(self, _=None):
+        if self._ds is None:
+            return
+        t_idx = int(round(float(self._t_slider.get())))
+        self._t_lbl.config(text=f"t = {self._ds.times[t_idx]:.0f} s")
+        if self._rescan_af is not None:
+            self.after_cancel(self._rescan_af)
+        self._rescan_af = self.after(250, lambda: self._rescan(t_idx))
+
+    def _t_first(self):
+        if self._ds is None:
+            return
+        self._t_slider.set(0)
+        self._rescan(0)
+
+    def _t_last(self):
+        if self._ds is None:
+            return
+        n = self._ds.ntimes - 1
+        self._t_slider.set(n)
+        self._rescan(n)
+
+    def _t_prev(self):
+        if self._ds is None:
+            return
+        t = max(0, self._t_idx - 1)
+        self._t_slider.set(t)
+        self._rescan(t)
+
+    def _t_next(self):
+        if self._ds is None:
+            return
+        t = min(self._ds.ntimes - 1, self._t_idx + 1)
+        self._t_slider.set(t)
+        self._rescan(t)
+
+    def _rescan(self, t_idx):
+        if self._ds is None or self._radar is None:
+            return
+        if self._scanning:
+            self._pending_t = t_idx
+            return
+        self._scanning  = True
+        self._pending_t = None
+        self._t_busy.config(text="Scanning…")
+        mode  = self._mode
+        radar = self._radar
+        ds    = self._ds
+        angle = round(self._v_angle.get(), 1)
+
+        import threading
+        def _run():
+            try:
+                if mode == 'ppi':
+                    result = radar.scan_ppi(ds, t_idx, angle)
+                else:
+                    result = radar.scan_rhi(ds, t_idx, angle)
+                def _done():
+                    self._result = result
+                    self._t_idx  = t_idx
+                    r_edges  = result.get('r_edges')
+                    r_km_arr = result.get('r_km')
+                    r_max = float(r_edges[-1]) if r_edges is not None \
+                            else (float(r_km_arr[-1]) if r_km_arr is not None else 200.0)
+                    self._r_zoom_slider.configure(to=max(r_max, 5.0))
+                    self.replot(self._current_product)
+                    self._t_busy.config(text="")
+                    self._scanning = False
+                    if self._pending_t is not None:
+                        pending, self._pending_t = self._pending_t, None
+                        self._rescan(pending)
+                self.after(0, _done)
+            except Exception as exc:
+                def _err(msg=str(exc)):
+                    self._t_busy.config(text=f"Error: {msg}")
+                    self._scanning = False
+                self.after(0, _err)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── private helpers ────────────────────────────────────────────────────────
 
