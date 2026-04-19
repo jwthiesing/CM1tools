@@ -117,6 +117,28 @@ class CM1Dataset:
             return name
         return getattr(var, 'long_name', name) or name
 
+    def add_paths(self, new_paths):
+        """Append new files; returns number successfully added."""
+        n_added = 0
+        times_list = list(self._times)
+        for p in sorted(new_paths):
+            try:
+                ds = nc.Dataset(p, 'r')
+            except Exception:
+                continue
+            di = len(self._dsets)
+            self._dsets.append(ds)
+            try:
+                t = ds.variables['time'][:]
+            except KeyError:
+                t = np.array([0.0])
+            for ti, tv in enumerate(t):
+                self._time_map.append((di, ti))
+                times_list.append(float(tv))
+            n_added += 1
+        self._times = np.array(times_list)
+        return n_added
+
     def close(self):
         for ds in self._dsets:
             ds.close()
@@ -160,10 +182,16 @@ class CM1Viewer(tk.Tk):
         self.title("CM1 netCDF Viewer")
         self.minsize(1100, 700)
 
-        self._ds       = None
-        self._t_idx    = 0
-        self._play_id  = None
-        self._last_field = None
+        self._ds           = None
+        self._t_idx        = 0
+        self._play_id      = None
+        self._playing      = False
+        self._last_field   = None
+        self._sounding_mode = False
+        self._mpl_cid      = None
+        self._watch_dir    = None
+        self._watch_known  = set()
+        self._watch_id     = None
 
         self._build_vars()
         self._build_ui()
@@ -179,10 +207,15 @@ class CM1Viewer(tk.Tk):
         self.v_vmax       = tk.StringVar(value='')
         self.v_winds      = tk.BooleanVar(value=False)
         self.v_wind_skip  = tk.IntVar(value=4)
+        self.v_wind_type  = tk.StringVar(value='arrows')
         self.v_ctr_field  = tk.StringVar(value='')
         self.v_ctr_levels = tk.IntVar(value=8)
         self.v_ctr_color  = tk.StringVar(value='black')
         self.v_ctr_labels = tk.BooleanVar(value=False)
+        self.v_ctr_style  = tk.StringVar(value='solid')
+        self.v_ctr_min    = tk.StringVar(value='')
+        self.v_ctr_max    = tk.StringVar(value='')
+        self.v_ctr_sym    = tk.BooleanVar(value=False)
         self.v_xmin = tk.StringVar(value='')
         self.v_xmax = tk.StringVar(value='')
         self.v_ymin = tk.StringVar(value='')
@@ -191,6 +224,7 @@ class CM1Viewer(tk.Tk):
         self.v_ylim_sym = tk.BooleanVar(value=False)
         self.v_gif_t0     = tk.StringVar(value='0')
         self.v_gif_t1     = tk.StringVar(value='')
+        self.v_live       = tk.BooleanVar(value=True)
 
     # ── UI ───────────────────────────────────────────────────────────────────
 
@@ -218,8 +252,14 @@ class CM1Viewer(tk.Tk):
         top.pack(fill='x', padx=6, pady=4)
 
         ttk.Button(top, text="Open file(s)…", command=self._open).pack(side='left', padx=4)
+        ttk.Button(top, text="Open dir…", command=self._open_dir).pack(side='left', padx=4)
+        self._snd_btn = ttk.Button(top, text="Take Sounding",
+                                   command=self._toggle_sounding_mode)
+        self._snd_btn.pack(side='left', padx=4)
         self._file_lbl = ttk.Label(top, text="No file loaded.", foreground='gray')
         self._file_lbl.pack(side='left', padx=8)
+        self._watch_lbl = ttk.Label(top, text="", foreground='#080')
+        self._watch_lbl.pack(side='left', padx=4)
 
         ttk.Label(top, text="Field:").pack(side='left')
         self._field_cb = ttk.Combobox(top, textvariable=self.v_field, width=18)
@@ -237,10 +277,32 @@ class CM1Viewer(tk.Tk):
         main = ttk.Frame(self)
         main.pack(fill='both', expand=True, padx=6, pady=2)
 
-        # Left controls — packed first so it claims its space before right expands
-        left = ttk.Frame(main, width=230)
-        left.pack(side='left', fill='y')
-        left.pack_propagate(False)
+        # Left controls — scrollable panel
+        left_outer = ttk.Frame(main, width=248)
+        left_outer.pack(side='left', fill='y')
+        left_outer.pack_propagate(False)
+
+        _lsb = ttk.Scrollbar(left_outer, orient='vertical')
+        _lsb.pack(side='right', fill='y')
+        _lcv = tk.Canvas(left_outer, yscrollcommand=_lsb.set,
+                         highlightthickness=0, width=230)
+        _lcv.pack(side='left', fill='both', expand=True)
+        _lsb.config(command=_lcv.yview)
+
+        left = ttk.Frame(_lcv)
+        _lcv_win = _lcv.create_window((0, 0), window=left, anchor='nw')
+
+        def _on_left_configure(e):
+            _lcv.configure(scrollregion=_lcv.bbox('all'))
+        def _on_lcv_resize(e):
+            _lcv.itemconfig(_lcv_win, width=e.width)
+        left.bind('<Configure>', _on_left_configure)
+        _lcv.bind('<Configure>', _on_lcv_resize)
+
+        def _on_mousewheel(e):
+            _lcv.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+        left_outer.bind_all('<MouseWheel>', _on_mousewheel)
+
         self._build_controls(left)
 
         ttk.Separator(main, orient='vertical').pack(side='left', fill='y', padx=2)
@@ -258,6 +320,8 @@ class CM1Viewer(tk.Tk):
         self._canvas.get_tk_widget().pack(fill='both', expand=True)
         tb = NavigationToolbar2Tk(self._canvas, right, pack_toolbar=False)
         tb.pack(fill='x')
+        self._mpl_cid = self._fig.canvas.mpl_connect(
+            'button_press_event', self._on_canvas_click)
 
         # ── bottom: time controls + save ────────────────────────────────
         bot = ttk.Frame(self)
@@ -355,7 +419,7 @@ class CM1Viewer(tk.Tk):
         # Wind overlay
         wf = ttk.LabelFrame(parent, text="Wind overlay")
         wf.pack(fill='x', padx=6, pady=4)
-        ttk.Checkbutton(wf, text="Show vectors",
+        ttk.Checkbutton(wf, text="Show winds",
                         variable=self.v_winds,
                         command=self._plot).pack(anchor='w', padx=6, pady=2)
         row = ttk.Frame(wf)
@@ -363,6 +427,12 @@ class CM1Viewer(tk.Tk):
         ttk.Label(row, text="Skip N:").pack(side='left')
         ttk.Spinbox(row, from_=1, to=20, textvariable=self.v_wind_skip,
                     width=4, command=self._plot).pack(side='left', padx=4)
+        row2 = ttk.Frame(wf)
+        row2.pack(fill='x', padx=6, pady=(0, 4))
+        ttk.Radiobutton(row2, text="Arrows", variable=self.v_wind_type,
+                        value='arrows', command=self._plot).pack(side='left')
+        ttk.Radiobutton(row2, text="Barbs", variable=self.v_wind_type,
+                        value='barbs', command=self._plot).pack(side='left', padx=6)
 
         # Contour overlay
         ctrf = ttk.LabelFrame(parent, text="Contour overlay")
@@ -391,9 +461,28 @@ class CM1Viewer(tk.Tk):
         ]
         self._ctr_color_cb = ttk.Combobox(
             ctrf, textvariable=self.v_ctr_color, width=18, values=_ctr_colors)
-        self._ctr_color_cb.pack(fill='x', padx=6, pady=(2, 6))
+        self._ctr_color_cb.pack(fill='x', padx=6, pady=(2, 4))
         self._autocomplete(self._ctr_color_cb, lambda: _ctr_colors, self._plot)
         self.v_ctr_color.trace_add('write', lambda *_: self._plot())
+
+        ttk.Label(ctrf, text="Line style:").pack(anchor='w', padx=6)
+        _style_row = ttk.Frame(ctrf)
+        _style_row.pack(fill='x', padx=6, pady=(0, 6))
+        ttk.Radiobutton(_style_row, text="Solid", variable=self.v_ctr_style,
+                        value='solid', command=self._plot).pack(side='left')
+        ttk.Radiobutton(_style_row, text="Dashed", variable=self.v_ctr_style,
+                        value='dashed', command=self._plot).pack(side='left', padx=4)
+        ttk.Radiobutton(_style_row, text="+solid /−dash", variable=self.v_ctr_style,
+                        value='pn', command=self._plot).pack(side='left')
+
+        ttk.Label(ctrf, text="Range (min / max):").pack(anchor='w', padx=6, pady=(4, 0))
+        _cr = ttk.Frame(ctrf)
+        _cr.pack(fill='x', padx=6, pady=2)
+        _lim_entry(_cr, self.v_ctr_min, self.v_ctr_max, self.v_ctr_sym, is_max=False).pack(side='left')
+        ttk.Label(_cr, text="/").pack(side='left', padx=4)
+        _lim_entry(_cr, self.v_ctr_max, self.v_ctr_min, self.v_ctr_sym, is_max=True).pack(side='left')
+        ttk.Checkbutton(ctrf, text="Symmetric", variable=self.v_ctr_sym,
+                        command=self._plot).pack(anchor='w', padx=6, pady=(0, 6))
 
     def _build_time_bar(self, parent):
         # Playback row
@@ -426,6 +515,9 @@ class CM1Viewer(tk.Tk):
         ttk.Spinbox(pb, from_=1, to=30, textvariable=self.v_fps,
                     width=4).pack(side='left')
 
+        ttk.Checkbutton(pb, text="Live", variable=self.v_live).pack(
+            side='left', padx=(12, 2))
+
         # Save row
         sv = ttk.Frame(parent)
         sv.pack(fill='x', pady=(4, 0))
@@ -442,6 +534,150 @@ class CM1Viewer(tk.Tk):
         self._gif_progress = ttk.Label(sv, text="", foreground='#226')
         self._gif_progress.pack(side='left', padx=4)
 
+    # ── sounding ─────────────────────────────────────────────────────────────
+
+    def _toggle_sounding_mode(self):
+        if self._ds is None:
+            messagebox.showwarning("No data", "Open a file first.")
+            return
+        self._sounding_mode = not self._sounding_mode
+        if self._sounding_mode:
+            self._snd_btn.config(text="Cancel Sounding")
+            self._canvas.get_tk_widget().config(cursor='crosshair')
+        else:
+            self._snd_btn.config(text="Take Sounding")
+            self._canvas.get_tk_widget().config(cursor='')
+
+    def _on_canvas_click(self, event):
+        if not self._sounding_mode or event.inaxes != self._ax:
+            return
+        if event.button != 1:
+            return
+        self._sounding_mode = False
+        self._snd_btn.config(text="Take Sounding")
+        self._canvas.get_tk_widget().config(cursor='')
+        self._take_sounding(event.xdata, event.ydata)
+
+    def _take_sounding(self, cx, cy):
+        try:
+            import sounderpy as spy
+        except ImportError:
+            messagebox.showerror("sounderpy missing",
+                                 "Install sounderpy:  pip install sounderpy")
+            return
+
+        ds  = self._ds
+        t   = self._t_idx
+        xh, yh, zh = ds.xh, ds.yh, ds.zh
+        view = self.v_view.get()
+        frac = float(self._cs_slider.get()) if hasattr(self, '_cs_slider') else 0.5
+
+        # Resolve clicked coordinates to grid indices
+        if view == 'plan':
+            xi = int(np.argmin(np.abs(xh - cx)))
+            yi = int(np.argmin(np.abs(yh - cy)))
+        elif view == 'xz':
+            xi = int(np.argmin(np.abs(xh - cx)))
+            yi = int(np.clip(frac * (len(yh) - 1), 0, len(yh) - 1))
+        else:  # yz
+            xi = int(np.clip(frac * (len(xh) - 1), 0, len(xh) - 1))
+            yi = int(np.argmin(np.abs(yh - cx)))
+
+        def _col(name):
+            if name in ds.fields_3d:
+                return ds.get_field(name, t)[:, yi, xi]
+            return None
+
+        th_col  = _col('th')
+        prs_col = _col('prs')
+        qv_col  = _col('qv')
+        u_col   = _col('uinterp') if 'uinterp' in ds.fields_3d else _col('u')
+        v_col   = _col('vinterp') if 'vinterp' in ds.fields_3d else _col('v')
+
+        if th_col is None or prs_col is None:
+            messagebox.showerror("Sounding error",
+                                 "Need 'th' and 'prs' output fields to build a sounding.")
+            return
+
+        Rd, cp = 287.04, 1004.0
+        T_c  = th_col * (prs_col / 1e5) ** (Rd / cp) - 273.15
+
+        if qv_col is not None:
+            qv_c  = np.maximum(qv_col, 1e-10)
+            e_pa  = qv_c * prs_col / (0.622 + qv_c)
+            e_pa  = np.maximum(e_pa, 1e-3)
+            Td_c  = 243.5 * np.log(e_pa / 611.2) / (17.67 - np.log(e_pa / 611.2))
+        else:
+            Td_c  = T_c - 30.0
+
+        from metpy.units import units as munits
+
+        # zh in km → m
+        z_m   = zh * 1000.0 if np.nanmax(zh) < 1000 else zh
+        p_hpa = prs_col / 100.0
+        u_ms  = u_col if u_col is not None else np.zeros_like(T_c)
+        v_ms  = v_col if v_col is not None else np.zeros_like(T_c)
+        u_kt  = u_ms * 1.94384
+        v_kt  = v_ms * 1.94384
+
+        clean_data = {
+            'p':  p_hpa * munits('hPa'),
+            'T':  T_c   * munits('degC'),
+            'Td': Td_c  * munits('degC'),
+            'u':  u_kt  * munits('kt'),
+            'v':  v_kt  * munits('kt'),
+            'z':  z_m   * munits('m'),
+        }
+        t_str = _sec_label(ds.times[t])
+        loc_str = f'({xh[xi]:.1f}, {yh[yi]:.1f}) km'
+        clean_data['site_info'] = {
+            'site-name':   f'CM1  {loc_str}',
+            'site-latlon': (0.0, 0.0),
+            'site-elv':    0,
+            'source':      'CM1',
+            'model':       'CM1',
+            'fcst-hour':   0,
+            'run-time':    ['', '', '', ''],
+            'valid-time':  ['', '', '', ''],
+        }
+        clean_data['titles'] = {
+            'top_title':   f'CM1 Model Sounding  |  {loc_str}  |  t = {t_str}',
+            'left_title':  'CM1',
+            'right_title': '',
+        }
+        import matplotlib
+        import matplotlib.pyplot as mplt
+        import tempfile, subprocess, sys
+
+        before = set(mplt.get_fignums())
+        _orig_show = mplt.show
+        mplt.show = lambda *a, **kw: None
+        try:
+            spy.build_sounding(clean_data, style='full', color_blind=False,
+                               dark_mode=False)
+        except Exception as e:
+            mplt.show = _orig_show
+            messagebox.showerror("sounderpy error", str(e))
+            return
+        finally:
+            mplt.show = _orig_show
+
+        new_figs = set(mplt.get_fignums()) - before
+        if not new_figs:
+            return
+        fn = next(iter(new_figs))
+        fig = mplt.figure(fn)
+        tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+        fig.savefig(tmp.name, dpi=150, bbox_inches='tight')
+        mplt.close(fig)
+        tmp.close()
+        if sys.platform == 'darwin':
+            subprocess.Popen(['open', tmp.name])
+        elif sys.platform.startswith('linux'):
+            subprocess.Popen(['xdg-open', tmp.name])
+        else:
+            subprocess.Popen(['start', tmp.name], shell=True)
+
     # ── open ─────────────────────────────────────────────────────────────────
 
     def _open(self):
@@ -451,18 +687,39 @@ class CM1Viewer(tk.Tk):
         if not paths:
             return
         try:
-            if self._ds:
-                self._ds.close()
-            self._ds = CM1Dataset(list(paths))
+            new_ds = CM1Dataset(list(paths))
         except Exception as e:
             messagebox.showerror("Load error", str(e))
             return
-
+        self._stop_watching()
         names = [os.path.basename(p) for p in paths]
-        self._file_lbl.config(
-            text=f"{len(names)} file(s): {', '.join(names[:3])}"
-                 + ("…" if len(names) > 3 else ""),
-            foreground='black')
+        label = (f"{len(names)} file(s): {', '.join(names[:3])}"
+                 + ("…" if len(names) > 3 else ""))
+        self._apply_dataset(new_ds, label)
+
+    def _open_dir(self):
+        directory = filedialog.askdirectory(title="Open CM1 output directory")
+        if not directory:
+            return
+        paths = sorted(glob.glob(os.path.join(directory, '*.nc')))
+        if not paths:
+            messagebox.showwarning("No files", "No .nc files found in that directory.")
+            return
+        try:
+            new_ds = CM1Dataset(paths)
+        except Exception as e:
+            messagebox.showerror("Load error", str(e))
+            return
+        self._stop_watching()
+        self._apply_dataset(new_ds, f"{os.path.basename(directory)}/ ({len(paths)} files)")
+        self._start_watching(directory, set(paths))
+
+    def _apply_dataset(self, new_ds, label_text):
+        if self._ds:
+            self._ds.close()
+        self._ds = new_ds
+
+        self._file_lbl.config(text=label_text, foreground='black')
 
         all_fields = self._ds.fields_3d + self._ds.fields_2d
         self._all_fields = all_fields
@@ -470,7 +727,7 @@ class CM1Viewer(tk.Tk):
         self._field_cb['values'] = all_fields
         self._ctr_cb['values']   = self._all_ctr_fields
         self._cmap_cb['values']  = CMAPS
-        if all_fields:
+        if all_fields and not self.v_field.get():
             self.v_field.set(all_fields[0])
         self.v_ctr_field.set('')
 
@@ -479,15 +736,50 @@ class CM1Viewer(tk.Tk):
         self._t_slider.set(0)
         self._t_idx = 0
 
-        # z slider
         nk = len(self._ds.zh)
         self._z_slider.config(to=max(nk - 1, 1))
         self._z_slider.set(nk // 2)
 
         self.v_gif_t1.set(str(int(self._ds.times[-1])) if nt > 0 else '')
-
         self._plot()
-        self._canvas.draw()   # force immediate render after dialog closes
+        self._canvas.draw()
+
+    def _start_watching(self, directory, known_paths):
+        self._watch_dir   = directory
+        self._watch_known = known_paths
+        self._watch_lbl.config(text=f"⏺ Watching {os.path.basename(directory)}/")
+        self._schedule_poll()
+
+    def _stop_watching(self):
+        if self._watch_id is not None:
+            self.after_cancel(self._watch_id)
+            self._watch_id = None
+        self._watch_dir = None
+        self._watch_known.clear()
+        self._watch_lbl.config(text="")
+
+    def _schedule_poll(self):
+        self._watch_id = self.after(5000, self._poll_dir)
+
+    def _poll_dir(self):
+        if self._watch_dir is None or self._ds is None:
+            return
+        current = set(glob.glob(os.path.join(self._watch_dir, '*.nc')))
+        new_paths = sorted(current - self._watch_known)
+        if new_paths:
+            n = self._ds.add_paths(new_paths)
+            if n:
+                self._watch_known |= set(new_paths)
+                nt = self._ds.ntimes
+                was_at_end = (self._t_idx >= nt - n - 1)
+                self._t_slider.config(to=max(nt - 1, 1))
+                self.v_gif_t1.set(str(int(self._ds.times[-1])))
+                name = os.path.basename(self._watch_dir)
+                self._watch_lbl.config(
+                    text=f"⏺ Watching {name}/ ({len(self._watch_known)} files)")
+                if self.v_live.get() and (was_at_end or not self._playing):
+                    self._set_time(nt - 1)
+        self._schedule_poll()
 
     # ── slider callbacks ─────────────────────────────────────────────────────
 
@@ -556,20 +848,25 @@ class CM1Viewer(tk.Tk):
         self._plot()
 
     def _toggle_play(self):
-        if self._play_id is not None:
-            self.after_cancel(self._play_id)
-            self._play_id = None
+        if self._playing:
+            self._playing = False
+            if self._play_id is not None:
+                self.after_cancel(self._play_id)
+                self._play_id = None
             self._play_btn.config(text="▶")
         else:
+            self._playing = True
             self._play_btn.config(text="⏸")
             self._advance_play()
 
     def _advance_play(self):
-        if self._ds is None or self._play_id is None and self._play_btn['text'] == '▶':
+        if not self._playing or self._ds is None:
             return
         self._t_next()
         if self._t_idx >= self._ds.ntimes - 1:
-            self._toggle_play()
+            self._playing = False
+            self._play_id = None
+            self._play_btn.config(text="▶")
             return
         fps = max(1, self.v_fps.get())
         self._play_id = self.after(int(1000 / fps), self._advance_play)
@@ -810,23 +1107,55 @@ class CM1Viewer(tk.Tk):
                 cslice, X, Y = cdata[:, :, ii], yh, zh
 
         try:
-            kwargs = dict(levels=nlevs, linewidths=1.2)
-            if is_cmap:
-                kwargs['cmap'] = color_val
+            style    = self.v_ctr_style.get()
+            label    = self.v_ctr_labels.get()
+            lw       = 1.2
+            color_kw = {'cmap': color_val} if is_cmap else {'colors': color_val}
+
+            # resolve explicit min/max/sym
+            try:    clo = float(self.v_ctr_min.get())
+            except ValueError: clo = None
+            try:    chi = float(self.v_ctr_max.get())
+            except ValueError: chi = None
+            sym = self.v_ctr_sym.get()
+            if clo is None and chi is None:
+                clo = float(np.nanmin(cslice))
+                chi = float(np.nanmax(cslice))
             else:
-                kwargs['colors'] = color_val
-            cs = ax.contour(X, Y, cslice, **kwargs)
-            if self.v_ctr_labels.get():
-                ax.clabel(cs, inline=True, fontsize=7, fmt='%g')
+                if sym:
+                    if chi is not None and clo is None:
+                        clo = -chi
+                    elif clo is not None and chi is None:
+                        chi = -clo
+                clo = clo if clo is not None else float(np.nanmin(cslice))
+                chi = chi if chi is not None else float(np.nanmax(cslice))
+            levels = np.linspace(clo, chi, nlevs)
+
+            if style == 'pn':
+                pos = [l for l in levels if l > 0]
+                neg = [l for l in levels if l < 0]
+                for levs, ls in [(pos, 'solid'), (neg, 'dashed')]:
+                    if not levs:
+                        continue
+                    cs = ax.contour(X, Y, cslice, levels=levs,
+                                    linewidths=lw, linestyles=ls, **color_kw)
+                    if label:
+                        ax.clabel(cs, inline=True, fontsize=7, fmt='%g')
+            else:
+                cs = ax.contour(X, Y, cslice, levels=levels, linewidths=lw,
+                                linestyles=style, **color_kw)
+                if label:
+                    ax.clabel(cs, inline=True, fontsize=7, fmt='%g')
         except Exception:
             pass
 
     def _add_colorbar(self, im, field):
-        self._cax.cla()
-        self._cbar = self._fig.colorbar(im, cax=self._cax)
-        units = self._ds.get_units(field)
-        if units:
-            self._cbar.set_label(units, fontsize=9)
+        if self._cbar is None:
+            self._cbar = self._fig.colorbar(im, cax=self._cax)
+        else:
+            self._cbar.update_normal(im)
+        units = self._ds.get_units(field) or ''
+        self._cbar.set_label(units, fontsize=9)
 
     # ── wind overlays ────────────────────────────────────────────────────────
 
@@ -839,6 +1168,15 @@ class CM1Viewer(tk.Tk):
         else:
             return 'vinterp', 'winterp'
 
+    def _draw_wind(self, ax, x1d, y1d, u, v):
+        """Draw quiver arrows or barbs depending on user selection."""
+        if self.v_wind_type.get() == 'barbs':
+            ax.barbs(x1d, y1d, u, v, color='k', alpha=0.7,
+                     length=6, linewidth=0.8)
+        else:
+            ax.quiver(x1d, y1d, u, v,
+                      scale=None, color='k', alpha=0.6, width=0.002)
+
     def _overlay_winds_plan(self, ax, ki, xh, yh, t_sec):
         # wind data is (nz, ny, nx); select level ki → (ny, nx)
         sk = max(1, self.v_wind_skip.get())
@@ -846,8 +1184,7 @@ class CM1Viewer(tk.Tk):
             if u_n in self._ds.fields_3d and v_n in self._ds.fields_3d:
                 u = self._ds.get_field(u_n, self._t_idx)[ki, ::sk, ::sk]
                 v = self._ds.get_field(v_n, self._t_idx)[ki, ::sk, ::sk]
-                ax.quiver(xh[::sk], yh[::sk], u, v,
-                          scale=None, color='k', alpha=0.6, width=0.002)
+                self._draw_wind(ax, xh[::sk], yh[::sk], u, v)
                 return
 
     def _overlay_winds_xz(self, ax, ji, xh, zh, t_sec):
@@ -858,8 +1195,7 @@ class CM1Viewer(tk.Tk):
                 if u_n in self._ds.fields_3d and w_n in self._ds.fields_3d:
                     u = self._ds.get_field(u_n, self._t_idx)[::sk, ji, ::sk]
                     w = self._ds.get_field(w_n, self._t_idx)[::sk, ji, ::sk]
-                    ax.quiver(xh[::sk], zh[::sk], u, w,
-                              scale=None, color='k', alpha=0.6, width=0.002)
+                    self._draw_wind(ax, xh[::sk], zh[::sk], u, w)
                     return
 
     def _overlay_winds_yz(self, ax, ii, yh, zh, t_sec):
@@ -870,8 +1206,7 @@ class CM1Viewer(tk.Tk):
                 if v_n in self._ds.fields_3d and w_n in self._ds.fields_3d:
                     v = self._ds.get_field(v_n, self._t_idx)[::sk, ::sk, ii]
                     w = self._ds.get_field(w_n, self._t_idx)[::sk, ::sk, ii]
-                    ax.quiver(yh[::sk], zh[::sk], v, w,
-                              scale=None, color='k', alpha=0.6, width=0.002)
+                    self._draw_wind(ax, yh[::sk], zh[::sk], v, w)
                     return
 
     # ── save PNG ─────────────────────────────────────────────────────────────
@@ -949,4 +1284,5 @@ class CM1Viewer(tk.Tk):
 
 if __name__ == '__main__':
     app = CM1Viewer()
+    app.protocol('WM_DELETE_WINDOW', lambda: (app._stop_watching(), app.destroy()))
     app.mainloop()
