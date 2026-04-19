@@ -210,6 +210,7 @@ class CM1Viewer(tk.Tk):
         self.v_wind_type  = tk.StringVar(value='arrows')
         self.v_ctr_field  = tk.StringVar(value='')
         self.v_ctr_levels = tk.IntVar(value=8)
+        self.v_ctr_lw     = tk.DoubleVar(value=1.2)
         self.v_ctr_color  = tk.StringVar(value='black')
         self.v_ctr_labels = tk.BooleanVar(value=False)
         self.v_ctr_style  = tk.StringVar(value='solid')
@@ -449,6 +450,10 @@ class CM1Viewer(tk.Tk):
         ttk.Label(row, text="Levels:").pack(side='left')
         ttk.Spinbox(row, from_=2, to=40, textvariable=self.v_ctr_levels,
                     width=4, command=self._plot).pack(side='left', padx=4)
+        ttk.Label(row, text="LW:").pack(side='left', padx=(8, 0))
+        ttk.Spinbox(row, from_=0.1, to=10.0, increment=0.1,
+                    textvariable=self.v_ctr_lw, width=5,
+                    command=self._plot).pack(side='left', padx=4)
         ttk.Checkbutton(ctrf, text="Label contours", variable=self.v_ctr_labels,
                         command=self._plot).pack(anchor='w', padx=6, pady=(0, 2))
 
@@ -1109,7 +1114,7 @@ class CM1Viewer(tk.Tk):
         try:
             style    = self.v_ctr_style.get()
             label    = self.v_ctr_labels.get()
-            lw       = 1.2
+            lw       = max(0.1, self.v_ctr_lw.get())
             color_kw = {'cmap': color_val} if is_cmap else {'colors': color_val}
 
             # resolve explicit min/max/sym
