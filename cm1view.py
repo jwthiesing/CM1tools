@@ -206,7 +206,8 @@ class CM1Viewer(tk.Tk):
         self.v_vmin       = tk.StringVar(value='')
         self.v_vmax       = tk.StringVar(value='')
         self.v_winds      = tk.BooleanVar(value=False)
-        self.v_wind_skip  = tk.IntVar(value=4)
+        self.v_wind_skip_x = tk.IntVar(value=4)
+        self.v_wind_skip_y = tk.IntVar(value=4)
         self.v_wind_type  = tk.StringVar(value='arrows')
         self.v_ctr_field  = tk.StringVar(value='')
         self.v_ctr_levels = tk.IntVar(value=8)
@@ -425,8 +426,11 @@ class CM1Viewer(tk.Tk):
                         command=self._plot).pack(anchor='w', padx=6, pady=2)
         row = ttk.Frame(wf)
         row.pack(fill='x', padx=6, pady=2)
-        ttk.Label(row, text="Skip N:").pack(side='left')
-        ttk.Spinbox(row, from_=1, to=20, textvariable=self.v_wind_skip,
+        ttk.Label(row, text="Skip X:").pack(side='left')
+        ttk.Spinbox(row, from_=1, to=50, textvariable=self.v_wind_skip_x,
+                    width=4, command=self._plot).pack(side='left', padx=4)
+        ttk.Label(row, text="Y:").pack(side='left')
+        ttk.Spinbox(row, from_=1, to=50, textvariable=self.v_wind_skip_y,
                     width=4, command=self._plot).pack(side='left', padx=4)
         row2 = ttk.Frame(wf)
         row2.pack(fill='x', padx=6, pady=(0, 4))
@@ -1194,34 +1198,37 @@ class CM1Viewer(tk.Tk):
 
     def _overlay_winds_plan(self, ax, ki, xh, yh, t_sec):
         # wind data is (nz, ny, nx); select level ki → (ny, nx)
-        sk = max(1, self.v_wind_skip.get())
+        sx = max(1, self.v_wind_skip_x.get())
+        sy = max(1, self.v_wind_skip_y.get())
         for u_n, v_n in [('uinterp', 'vinterp'), ('u', 'v')]:
             if u_n in self._ds.fields_3d and v_n in self._ds.fields_3d:
-                u = self._ds.get_field(u_n, self._t_idx)[ki, ::sk, ::sk]
-                v = self._ds.get_field(v_n, self._t_idx)[ki, ::sk, ::sk]
-                self._draw_wind(ax, xh[::sk], yh[::sk], u, v)
+                u = self._ds.get_field(u_n, self._t_idx)[ki, ::sy, ::sx]
+                v = self._ds.get_field(v_n, self._t_idx)[ki, ::sy, ::sx]
+                self._draw_wind(ax, xh[::sx], yh[::sy], u, v)
                 return
 
     def _overlay_winds_xz(self, ax, ji, xh, zh, t_sec):
         # wind data is (nz, ny, nx); select y=ji → (nz, nx)
-        sk = max(1, self.v_wind_skip.get())
+        sx = max(1, self.v_wind_skip_x.get())
+        sy = max(1, self.v_wind_skip_y.get())
         for u_n in ['uinterp', 'u']:
             for w_n in ['winterp', 'w']:
                 if u_n in self._ds.fields_3d and w_n in self._ds.fields_3d:
-                    u = self._ds.get_field(u_n, self._t_idx)[::sk, ji, ::sk]
-                    w = self._ds.get_field(w_n, self._t_idx)[::sk, ji, ::sk]
-                    self._draw_wind(ax, xh[::sk], zh[::sk], u, w)
+                    u = self._ds.get_field(u_n, self._t_idx)[::sy, ji, ::sx]
+                    w = self._ds.get_field(w_n, self._t_idx)[::sy, ji, ::sx]
+                    self._draw_wind(ax, xh[::sx], zh[::sy], u, w)
                     return
 
     def _overlay_winds_yz(self, ax, ii, yh, zh, t_sec):
         # wind data is (nz, ny, nx); select x=ii → (nz, ny)
-        sk = max(1, self.v_wind_skip.get())
+        sx = max(1, self.v_wind_skip_x.get())
+        sy = max(1, self.v_wind_skip_y.get())
         for v_n in ['vinterp', 'v']:
             for w_n in ['winterp', 'w']:
                 if v_n in self._ds.fields_3d and w_n in self._ds.fields_3d:
-                    v = self._ds.get_field(v_n, self._t_idx)[::sk, ::sk, ii]
-                    w = self._ds.get_field(w_n, self._t_idx)[::sk, ::sk, ii]
-                    self._draw_wind(ax, yh[::sk], zh[::sk], v, w)
+                    v = self._ds.get_field(v_n, self._t_idx)[::sy, ::sx, ii]
+                    w = self._ds.get_field(w_n, self._t_idx)[::sy, ::sx, ii]
+                    self._draw_wind(ax, yh[::sx], zh[::sy], v, w)
                     return
 
     # ── save PNG ─────────────────────────────────────────────────────────────
