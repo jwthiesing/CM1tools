@@ -782,6 +782,7 @@ class CM1Viewer(tk.Tk):
         self.v_gif_t1     = tk.StringVar(value='')
         self.v_live       = tk.BooleanVar(value=True)
         self.v_composite  = tk.BooleanVar(value=False)
+        self.v_maxheight  = tk.BooleanVar(value=False)
         # radar
         self.v_radar_band     = tk.StringVar(value='S')
         self.v_radar_dish     = tk.DoubleVar(value=4.2)
@@ -919,6 +920,9 @@ class CM1Viewer(tk.Tk):
         ttk.Checkbutton(lf, text="Composite (column max magnitude)",
                         variable=self.v_composite,
                         command=self._plot).pack(anchor='w', padx=6, pady=(4, 0))
+        ttk.Checkbutton(lf, text="Max height of non-zero (km)",
+                        variable=self.v_maxheight,
+                        command=self._plot).pack(anchor='w', padx=6, pady=(0, 2))
 
         ttk.Label(lf, text="Z level (plan view):").pack(anchor='w', padx=6, pady=2)
         self._z_slider = ttk.Scale(lf, from_=0, to=1, orient='horizontal',
@@ -1780,7 +1784,18 @@ class CM1Viewer(tk.Tk):
         frac = float(self._cs_slider.get())
 
         if view == 'plan':
-            if self.v_composite.get():
+            if self.v_maxheight.get():
+                # Height (km) of the topmost level where |value| exceeds 0.01 %
+                # of the column maximum — zero everywhere → NaN.
+                col_max = np.nanmax(np.abs(data), axis=0, keepdims=True)
+                tol     = np.where(col_max > 0, col_max * 1e-4, np.inf)
+                active  = np.abs(data) > tol           # (nz, ny, nx)
+                zh_col  = zh[:, None, None] * np.ones_like(data)
+                zh_col[~active] = np.nan
+                plot_data = np.nanmax(zh_col, axis=0)  # (ny, nx), km
+                title_z   = "max height of non-zero"
+                wind_ki   = ki
+            elif self.v_composite.get():
                 # Max-magnitude composite: pick the level with largest |value|
                 # and keep the original sign so signed cmaps work correctly.
                 abs_idx   = np.argmax(np.abs(data), axis=0)       # (ny, nx)
@@ -1788,7 +1803,7 @@ class CM1Viewer(tk.Tk):
                 iy        = np.arange(data.shape[2])[None, :]
                 plot_data = data[abs_idx, ix, iy]
                 title_z   = "composite"
-                wind_ki   = ki   # still overlay winds at the selected level
+                wind_ki   = ki
             else:
                 plot_data = data[ki, :, :]
                 title_z   = f"z = {zh[ki]:.2f} km"
@@ -1797,14 +1812,14 @@ class CM1Viewer(tk.Tk):
             im = ax.pcolormesh(xh, yh, plot_data,
                                cmap=cmap, norm=Normalize(vmin, vmax),
                                shading='nearest')
-            self._add_colorbar(im, field)
+            units_lbl = 'km' if self.v_maxheight.get() else self._ds.get_units(field)
+            self._add_colorbar(im, field, units=units_lbl)
             if self.v_winds.get():
                 self._overlay_winds_plan(ax, wind_ki, xh, yh, t_sec)
             ax.set_xlabel('x  (km)')
             ax.set_ylabel('y  (km)')
             ax.set_title(
-                f"{field}  —  {title_z},  t = {t_str}"
-                f"  [{self._ds.get_units(field)}]",
+                f"{field}  —  {title_z},  t = {t_str}  [{units_lbl}]",
                 fontsize=10)
 
         elif view == 'xz':
@@ -1933,13 +1948,13 @@ class CM1Viewer(tk.Tk):
         except Exception:
             pass
 
-    def _add_colorbar(self, im, field):
+    def _add_colorbar(self, im, field, units=None):
         if self._cbar is None:
             self._cbar = self._fig.colorbar(im, cax=self._cax)
         else:
             self._cbar.update_normal(im)
-        units = self._ds.get_units(field) or ''
-        self._cbar.set_label(units, fontsize=9)
+        label = units if units is not None else (self._ds.get_units(field) or '')
+        self._cbar.set_label(label, fontsize=9)
 
     # ── wind overlays ────────────────────────────────────────────────────────
 
