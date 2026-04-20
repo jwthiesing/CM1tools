@@ -783,6 +783,7 @@ class CM1Viewer(tk.Tk):
         self.v_live       = tk.BooleanVar(value=True)
         self.v_composite  = tk.BooleanVar(value=False)
         self.v_maxheight  = tk.BooleanVar(value=False)
+        self.v_file_stride = tk.IntVar(value=1)
         # radar
         self.v_radar_band     = tk.StringVar(value='S')
         self.v_radar_dish     = tk.DoubleVar(value=4.2)
@@ -825,6 +826,9 @@ class CM1Viewer(tk.Tk):
 
         ttk.Button(top, text="Open file(s)…", command=self._open).pack(side='left', padx=4)
         ttk.Button(top, text="Open dir…", command=self._open_dir).pack(side='left', padx=4)
+        ttk.Label(top, text="Every N:").pack(side='left', padx=(6, 1))
+        ttk.Spinbox(top, from_=1, to=100, width=4,
+                    textvariable=self.v_file_stride).pack(side='left', padx=(0, 4))
         self._snd_btn = ttk.Button(top, text="Take Sounding",
                                    command=self._toggle_sounding_mode)
         self._snd_btn.pack(side='left', padx=4)
@@ -1453,18 +1457,25 @@ class CM1Viewer(tk.Tk):
         directory = filedialog.askdirectory(title="Open CM1 output directory")
         if not directory:
             return
-        paths = sorted(glob.glob(os.path.join(directory, '*.nc')))
-        if not paths:
+        all_paths = sorted(glob.glob(os.path.join(directory, '*.nc')))
+        if not all_paths:
             messagebox.showwarning("No files", "No .nc files found in that directory.")
             return
+        try:
+            stride = max(1, int(self.v_file_stride.get()))
+        except (tk.TclError, ValueError):
+            stride = 1
+        paths = all_paths[::stride]
         try:
             new_ds = CM1Dataset(paths)
         except Exception as e:
             messagebox.showerror("Load error", str(e))
             return
         self._stop_watching()
-        self._apply_dataset(new_ds, f"{os.path.basename(directory)}/ ({len(paths)} files)")
-        self._start_watching(directory, set(paths))
+        stride_lbl = f", every {stride}" if stride > 1 else ""
+        self._apply_dataset(new_ds, f"{os.path.basename(directory)}/ ({len(paths)} files{stride_lbl})")
+        # Pass all_paths as known so the watcher ignores the skipped files
+        self._start_watching(directory, set(all_paths))
 
     def _apply_dataset(self, new_ds, label_text):
         if self._ds:
@@ -1479,7 +1490,7 @@ class CM1Viewer(tk.Tk):
         self._field_cb['values'] = all_fields
         self._ctr_cb['values']   = self._all_ctr_fields
         self._cmap_cb['values']  = CMAPS
-        if all_fields and not self.v_field.get():
+        if all_fields and self.v_field.get() not in all_fields:
             self.v_field.set(all_fields[0])
         if self.v_ctr_field.get() not in all_fields:
             self.v_ctr_field.set('')
