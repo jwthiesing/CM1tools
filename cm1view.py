@@ -30,6 +30,35 @@ import netCDF4 as nc
 
 
 # ---------------------------------------------------------------------------
+# Derived-field helpers
+# ---------------------------------------------------------------------------
+
+_SRH_DEPTHS = {'srh500': 500., 'srh1000': 1000., 'srh3000': 3000.}
+
+def _srh_2d(u3d, v3d, zh_agl, cx, cy, depth_m):
+    """Vectorised SRH (m²/s²) from surface to *depth_m* metres AGL.
+
+    u3d, v3d : (nz, ny, nx) Earth-relative wind components in m/s.
+    zh_agl   : (nz,) height AGL in metres for each model level.
+    cx, cy   : storm motion (m/s) – typically umove, vmove from namelist.
+    """
+    nz = u3d.shape[0]
+    srh = np.zeros(u3d.shape[1:], dtype=float)
+    for k in range(nz - 1):
+        z0 = float(zh_agl[k])
+        z1 = float(zh_agl[k + 1])
+        if z0 >= depth_m:
+            break
+        frac = min(1.0, (depth_m - z0) / max(z1 - z0, 1e-6))
+        u_top = u3d[k] + frac * (u3d[k + 1] - u3d[k])
+        v_top = v3d[k] + frac * (v3d[k + 1] - v3d[k])
+        du = u_top - u3d[k]
+        dv = v_top - v3d[k]
+        srh -= (u3d[k] - cx) * dv - (v3d[k] - cy) * du
+    return srh
+
+
+# ---------------------------------------------------------------------------
 # Data loader
 # ---------------------------------------------------------------------------
 
@@ -65,6 +94,16 @@ class CM1Dataset:
             nk = next(iter(ds0.dimensions.get(k) for k in ('zh', 'nz') if k in ds0.dimensions), None)
             self.zh = np.arange(len(self.xh)) if nk is None else np.arange(nk)
 
+        # Storm motion for SRH (umove/vmove from namelist, stored as scalar vars)
+        def _scalar(name):
+            v = ds0.variables.get(name)
+            if v is None:
+                return 0.0
+            arr = np.asarray(v[:]).ravel()
+            return float(arr[0]) if arr.size else 0.0
+        self.umove = _scalar('umove')
+        self.vmove = _scalar('vmove')
+
         # available 3-D and 2-D field names (skip coordinate/metadata vars)
         _coord = {'xh', 'xf', 'yh', 'yf', 'zh', 'zf', 'time', 'f_cor',
                   'ztop', 'umove', 'vmove', 'zs', 'zh_sfc'}
@@ -85,6 +124,11 @@ class CM1Dataset:
         self.fields_3d.sort()
         self.fields_2d.sort()
 
+        # Add derived SRH fields if horizontal winds are available
+        _wind_present = any(n in self.fields_3d for n in ('u', 'uinterp'))
+        if _wind_present:
+            self.fields_2d.extend(sorted(_SRH_DEPTHS.keys()))
+
     @property
     def ntimes(self):
         return len(self._times)
@@ -94,6 +138,8 @@ class CM1Dataset:
         return self._times
 
     def get_field(self, name, time_idx):
+        if name in _SRH_DEPTHS:
+            return self._compute_srh(time_idx, _SRH_DEPTHS[name])
         di, ti = self._time_map[time_idx]
         ds = self._dsets[di]
         var = ds.variables[name]
@@ -103,7 +149,17 @@ class CM1Dataset:
         slices[t_ax] = ti
         return np.array(var[tuple(slices)], dtype=float)
 
+    def _compute_srh(self, time_idx, depth_m):
+        u_name = 'uinterp' if 'uinterp' in self.fields_3d else 'u'
+        v_name = 'vinterp' if 'vinterp' in self.fields_3d else 'v'
+        u3d = self.get_field(u_name, time_idx)
+        v3d = self.get_field(v_name, time_idx)
+        zh_m = self.zh * 1000.0 if np.nanmax(self.zh) < 1000 else self.zh
+        return _srh_2d(u3d, v3d, zh_m, self.umove, self.vmove, depth_m)
+
     def get_units(self, name):
+        if name in _SRH_DEPTHS:
+            return 'm²/s²'
         ds0 = self._dsets[0]
         var = ds0.variables.get(name)
         if var is None:
@@ -111,6 +167,9 @@ class CM1Dataset:
         return getattr(var, 'units', '') or ''
 
     def get_longname(self, name):
+        if name in _SRH_DEPTHS:
+            depth = int(_SRH_DEPTHS[name])
+            return f'SRH  0–{depth} m AGL'
         ds0 = self._dsets[0]
         var = ds0.variables.get(name)
         if var is None:
