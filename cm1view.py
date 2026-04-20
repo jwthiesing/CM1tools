@@ -1299,12 +1299,17 @@ class CM1Viewer(tk.Tk):
         u_ms  = u_col if u_col is not None else np.zeros_like(T_c)
         v_ms  = v_col if v_col is not None else np.zeros_like(T_c)
 
+        # sounderpy strips MetPy units and labels wind statistics as "kt" using
+        # raw magnitudes — pass winds already in knots so the values are correct.
+        u_kt  = u_ms / 0.514444
+        v_kt  = v_ms / 0.514444
+
         clean_data = {
             'p':  p_hpa * munits('hPa'),
             'T':  T_c   * munits('degC'),
             'Td': Td_c  * munits('degC'),
-            'u':  u_ms  * munits('m/s'),
-            'v':  v_ms  * munits('m/s'),
+            'u':  u_kt  * munits('knots'),
+            'v':  v_kt  * munits('knots'),
             'z':  z_m   * munits('m'),
         }
         t_str = _sec_label(ds.times[t])

@@ -90,11 +90,13 @@ def build_cm1_sounding(clean_data):
     theta = _potential_temperature(T, p)
     qv    = _mixing_ratio(Td, p)
 
+    z_agl = z - z[0]  # CM1 expects metres AGL; IEM/BUFKIT heights are MSL
+
     lines = []
     lines.append(f"  {p[0]:10.4f}  {theta[0]:12.6f}  {qv[0]:12.6f}")
-    for i in range(len(z)):
+    for i in range(len(z_agl)):
         lines.append(
-            f"  {z[i]:12.4f}  {theta[i]:12.6f}  {qv[i]:12.6f}"
+            f"  {z_agl[i]:12.4f}  {theta[i]:12.6f}  {qv[i]:12.6f}"
             f"  {u[i]:12.6f}  {v[i]:12.6f}"
         )
     return lines
@@ -136,7 +138,7 @@ def _fetch_iem_raob(station, year, month, day, hour):
     """Fetch full-resolution RAOB from IEM ASOS/RAOB JSON API.
 
     Returns a sounderpy-compatible clean_data dict with MetPy pint quantities.
-    Heights come from IEM in feet; converted to metres here.
+    Heights from IEM are in metres MSL (not feet).
     Winds come as drct (deg FROM) + sknt (knots); converted to u/v m/s.
     Missing wind levels are linearly interpolated from neighbours.
     """
@@ -181,17 +183,20 @@ def _fetch_iem_raob(station, year, month, day, hour):
         drct = lev.get("drct")
         sknt = lev.get("sknt")
 
-        if drct is None or sknt is None:
-            continue  # skip levels with missing wind
-        spd_ms   = float(sknt) * 0.514444
-        drct_rad = np.radians(float(drct))
+        if drct is not None and sknt is not None:
+            spd_ms   = float(sknt) * 0.514444  # sknt is in knots per IEM API
+            drct_rad = np.radians(float(drct))
+            u = -spd_ms * np.sin(drct_rad)
+            v = -spd_ms * np.cos(drct_rad)
+        else:
+            u, v = np.nan, np.nan   # filled later by BUFKIT
 
         p_list.append(float(pres))
-        z_list.append(float(hght) * 0.3048)   # feet → metres
+        z_list.append(float(hght))   # already metres MSL (IEM returns metres, not feet)
         T_list.append(float(tmpc))
         Td_list.append(float(dwpc))
-        u_list.append(-spd_ms * np.sin(drct_rad))
-        v_list.append(-spd_ms * np.cos(drct_rad))
+        u_list.append(u)
+        v_list.append(v)
 
     if not p_list:
         raise ValueError("No valid levels found in IEM sounding")
@@ -289,38 +294,40 @@ def _fetch_bufkit_rap(station, year, month, day, hour):
     if stim0 is None:
         raise ValueError("No STIM=0 block in BUFKIT file")
 
-    # Column header after STIM=0 starts with 'PRES' (may span 2 lines)
+    # Column header after STIM=0 starts with 'PRES' (may span multiple lines)
     hdr = next((i for i in range(stim0 + 1, min(stim0 + 20, len(lines)))
                 if lines[i].strip().startswith('PRES')), None)
     if hdr is None:
         raise ValueError("No column header found after STIM=0")
 
-    # Data begins immediately after the (2-line) column header
-    data_start = hdr + 2
-
-    # Each level spans 2 lines (e.g. 8 values then 2 values); join pairs
-    p_l, z_l, T_l, Td_l, u_l, v_l = [], [], [], [], [], []
-
-    i = data_start
-    while i + 1 < len(lines):
-        parts = (lines[i] + ' ' + lines[i + 1]).split()
-        i += 2
+    # Collect every float value from after the header until the 99999 terminator,
+    # ignoring line breaks entirely (BUFKIT splits levels across variable # of lines)
+    raw = []
+    for line in lines[hdr + 1:]:
+        parts = line.split()
         if not parts:
             continue
         try:
-            if float(parts[0]) > 99990:
-                break
+            vals = [float(x) for x in parts]
         except ValueError:
-            break
+            continue                      # non-numeric line (STID etc.) → stop
+        if vals[0] > 99990:
+            break                         # 99999 terminator
+        raw.extend(vals)
 
+    n = len(cols)  # values per sounding level (from SNPARM)
+    p_l, z_l, T_l, Td_l, u_l, v_l = [], [], [], [], [], []
+
+    for k in range(0, len(raw) - n + 1, n):
+        rec = raw[k:k + n]
         try:
-            pres = float(parts[ip]); hght = float(parts[iz])
-            tmpc = float(parts[it]); dwpc = float(parts[id_])
-            drct = float(parts[idr]); sknt = float(parts[isk])
-        except (ValueError, IndexError):
+            pres = rec[ip]; hght = rec[iz]
+            tmpc = rec[it]; dwpc = rec[id_]
+            drct = rec[idr]; sknt = rec[isk]
+        except IndexError:
             continue
 
-        if pres <= 0 or tmpc < -9990 or hght < -9990:
+        if pres <= 0 or pres > 99990 or tmpc < -9990 or hght < -9990:
             continue
         if dwpc < -9990:
             dwpc = tmpc - 40.0
@@ -396,25 +403,60 @@ def _extend_with_model(clean_data, year, month, day, hour):
     if model_data is None:
         return clean_data, 0, "Could not fetch RAP/RUC data (BUFKIT and reanalysis both failed)"
 
-    z_ceil = z_m[-1]
-    mz = _mag(model_data['z'], 'm')
-    above = mz > z_ceil
-    if not above.any():
-        return clean_data, 0, "RAP/RUC profile has no levels above balloon ceiling"
+    import sys
+    mz  = _mag(model_data['z'], 'm')
+    mu  = _mag(model_data['u'], 'm/s')
+    mv  = _mag(model_data['v'], 'm/s')
 
+    # --- Fill missing IEM winds from BUFKIT across the full column ---
+    iem_u = _mag(clean_data['u'], 'm/s')
+    iem_v = _mag(clean_data['v'], 'm/s')
+    iem_z = z_m
+    iem_T = _mag(clean_data['T'], 'degC')
+
+    print(f"[diag] IEM balloon ceiling: {iem_z[-1]:.0f} m   levels: {len(iem_z)}", file=sys.stderr)
+    print(f"[diag] IEM T/wind profile (z_m, T_C, spd_ms, has_wind):", file=sys.stderr)
+    for i in range(len(iem_z)):
+        spd = np.sqrt(iem_u[i]**2 + iem_v[i]**2) if np.isfinite(iem_u[i]) else float('nan')
+        print(f"  {iem_z[i]:7.0f} m  T={iem_T[i]:6.1f}°C  spd={spd:5.1f} m/s  wind={'obs' if np.isfinite(iem_u[i]) else 'NaN'}", file=sys.stderr)
+    print(f"[diag] BUFKIT wind at key heights:", file=sys.stderr)
+    for tgt in [500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 12000]:
+        idx = np.argmin(np.abs(mz - tgt))
+        spd = np.sqrt(mu[idx]**2 + mv[idx]**2)
+        print(f"  z≈{tgt:5d}m  spd={spd:.1f} m/s  u={mu[idx]:.1f}  v={mv[idx]:.1f}", file=sys.stderr)
+
+    # Fill NaN winds by linear interpolation between surrounding IEM obs levels.
+    # The BUFKIT model can disagree significantly with the radiosonde (especially
+    # the jet stream), so we use obs-to-obs interpolation within the balloon column.
+    missing  = ~np.isfinite(iem_u)
+    obs_mask = np.isfinite(iem_u)
+    if missing.any() and obs_mask.sum() >= 2:
+        iem_u[missing] = np.interp(iem_z[missing], iem_z[obs_mask], iem_u[obs_mask])
+        iem_v[missing] = np.interp(iem_z[missing], iem_z[obs_mask], iem_v[obs_mask])
+
+    # --- Append BUFKIT levels above the balloon ceiling ---
+    z_ceil = iem_z[-1]
+    above  = mz > z_ceil
     n_model = int(above.sum())
+
     p_arr  = np.concatenate([_mag(clean_data['p'],  'hPa'),  _mag(model_data['p'],  'hPa')[above]])
-    z_arr  = np.concatenate([_mag(clean_data['z'],  'm'),    mz[above]])
+    z_arr  = np.concatenate([iem_z,                           mz[above]])
     T_arr  = np.concatenate([_mag(clean_data['T'],  'degC'), _mag(model_data['T'],  'degC')[above]])
     Td_arr = np.concatenate([_mag(clean_data['Td'], 'degC'), _mag(model_data['Td'], 'degC')[above]])
-    u_arr  = np.concatenate([_mag(clean_data['u'],  'm/s'),  _mag(model_data['u'],  'm/s')[above]])
-    v_arr  = np.concatenate([_mag(clean_data['v'],  'm/s'),  _mag(model_data['v'],  'm/s')[above]])
+    u_arr  = np.concatenate([iem_u,                           mu[above]])
+    v_arr  = np.concatenate([iem_v,                           mv[above]])
 
     order = np.argsort(z_arr)
     p_arr, z_arr, T_arr, Td_arr, u_arr, v_arr = (
         p_arr[order], z_arr[order], T_arr[order],
         Td_arr[order], u_arr[order], v_arr[order],
     )
+
+    print(f"[diag] Merged sounding wind at standard pressure levels:", file=sys.stderr)
+    for tp in [925, 850, 700, 500, 300, 200]:
+        idx = np.argmin(np.abs(p_arr - tp))
+        spd = np.sqrt(u_arr[idx]**2 + v_arr[idx]**2)
+        print(f"  {tp:4d} hPa  z={z_arr[idx]:6.0f}m MSL  spd={spd:.1f} m/s ({spd/0.51444:.0f} kt)  u={u_arr[idx]:.1f}  v={v_arr[idx]:.1f}", file=sys.stderr)
 
     extended = {
         'p':  p_arr  * munits.hPa,
