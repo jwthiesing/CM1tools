@@ -2320,6 +2320,8 @@ class RadarWindow(tk.Toplevel):
                 else:
                     result = radar.scan_rhi(ds, t_idx, angle)
                 def _done():
+                    if not self.winfo_exists():
+                        return
                     self._result = result
                     self._t_idx  = t_idx
                     r_edges  = result.get('r_edges')
@@ -2336,6 +2338,8 @@ class RadarWindow(tk.Toplevel):
                 self.after(0, _done)
             except Exception as exc:
                 def _err(msg=str(exc)):
+                    if not self.winfo_exists():
+                        return
                     self._t_busy.config(text=f"Error: {msg}")
                     self._scanning = False
                 self.after(0, _err)

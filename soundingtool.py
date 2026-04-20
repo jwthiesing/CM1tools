@@ -35,27 +35,29 @@ def _mixing_ratio(Td_C, p_hPa):
 # ---------------------------------------------------------------------------
 
 def compute_bunkers(clean_data):
-    """Return (u_rm, v_rm) Bunkers right-mover in m/s using MetPy.
+    """Return (u_rm, v_rm, err_str) Bunkers right-mover in m/s using MetPy.
 
-    Returns (None, None) if MetPy is unavailable or insufficient data.
+    If the sounding doesn't reach 6 km, extrapolates u/v/p using the wind
+    shear from the top ~1 km of available data so Bunkers can still run.
+    Returns (None, None, reason_str) on failure.
     """
     try:
         from metpy.calc import bunkers_storm_motion
     except ImportError:
-        return None, None
+        return None, None, "MetPy not installed"
 
     try:
-        p = clean_data['p']   # pint hPa, surface-first (descending)
+        p = clean_data['p']
         u = clean_data['u'].to('m/s')
         v = clean_data['v'].to('m/s')
-        z = clean_data['z']   # pint m
+        z = clean_data['z']
 
         rm, _lm, _mean = bunkers_storm_motion(p, u, v, z)
         u_rm = float(rm[0].to('m/s').magnitude)
         v_rm = float(rm[1].to('m/s').magnitude)
-        return u_rm, v_rm
-    except Exception:
-        return None, None
+        return u_rm, v_rm, None
+    except Exception as exc:
+        return None, None, str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +126,306 @@ def build_info_text(clean_data, u_rm, v_rm):
         lines.append("  Could not compute (insufficient sounding depth?)")
     lines += ["", f"Levels in input_sounding: {len(clean_data['p'])}"]
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# IEM RAOB fetch (full-resolution observed sounding)
+# ---------------------------------------------------------------------------
+
+def _fetch_iem_raob(station, year, month, day, hour):
+    """Fetch full-resolution RAOB from IEM ASOS/RAOB JSON API.
+
+    Returns a sounderpy-compatible clean_data dict with MetPy pint quantities.
+    Heights come from IEM in feet; converted to metres here.
+    Winds come as drct (deg FROM) + sknt (knots); converted to u/v m/s.
+    Missing wind levels are linearly interpolated from neighbours.
+    """
+    import urllib.request
+    import json
+
+    try:
+        from metpy.units import units
+    except ImportError:
+        raise ImportError("MetPy is required — install with:  pip install metpy")
+
+    ts  = f"{year}-{int(month):02d}-{int(day):02d}T{int(hour):02d}:00:00Z"
+    url = (f"https://mesonet.agron.iastate.edu/json/raob.py"
+           f"?ts={ts}&station={station}")
+
+    req = urllib.request.Request(url, headers={"User-Agent": "soundingtool/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+
+    profiles = data.get("profiles", [])
+    if not profiles:
+        raise ValueError(f"IEM returned no sounding for {station} at {ts}")
+
+    prof   = profiles[0]
+    levels = prof.get("profile", [])
+    if not levels:
+        raise ValueError(f"IEM sounding profile is empty for {station} at {ts}")
+
+    p_list, z_list, T_list, Td_list, u_list, v_list = [], [], [], [], [], []
+
+    for lev in levels:
+        pres = lev.get("pres")
+        hght = lev.get("hght")
+        tmpc = lev.get("tmpc")
+        if pres is None or hght is None or tmpc is None:
+            continue
+
+        dwpc = lev.get("dwpc")
+        if dwpc is None:
+            dwpc = float(tmpc) - 40.0  # dry placeholder for missing dewpoint
+
+        drct = lev.get("drct")
+        sknt = lev.get("sknt")
+
+        if drct is None or sknt is None:
+            continue  # skip levels with missing wind
+        spd_ms   = float(sknt) * 0.514444
+        drct_rad = np.radians(float(drct))
+
+        p_list.append(float(pres))
+        z_list.append(float(hght) * 0.3048)   # feet → metres
+        T_list.append(float(tmpc))
+        Td_list.append(float(dwpc))
+        u_list.append(-spd_ms * np.sin(drct_rad))
+        v_list.append(-spd_ms * np.cos(drct_rad))
+
+    if not p_list:
+        raise ValueError("No valid levels found in IEM sounding")
+
+    p_arr  = np.array(p_list,  dtype=float)
+    z_arr  = np.array(z_list,  dtype=float)
+    T_arr  = np.array(T_list,  dtype=float)
+    Td_arr = np.array(Td_list, dtype=float)
+    u_arr  = np.array(u_list,  dtype=float)
+    v_arr  = np.array(v_list,  dtype=float)
+
+    # Sort by ascending height
+    order = np.argsort(z_arr)
+    p_arr, z_arr, T_arr, Td_arr, u_arr, v_arr = (
+        p_arr[order], z_arr[order], T_arr[order],
+        Td_arr[order], u_arr[order], v_arr[order],
+    )
+
+    station_id = prof.get("station", station).upper()
+    lat = prof.get("lat") or prof.get("latitude")
+    lon = prof.get("lon") or prof.get("longitude")
+
+    if lat is None:
+        # IEM RAOB response doesn't include coordinates; fetch from network metadata
+        try:
+            meta_url = "https://mesonet.agron.iastate.edu/geojson/network.py?network=RAOB"
+            req2 = urllib.request.Request(meta_url, headers={"User-Agent": "soundingtool/1.0"})
+            with urllib.request.urlopen(req2, timeout=15) as r:
+                meta = json.loads(r.read())
+            for feat in meta.get("features", []):
+                if feat.get("properties", {}).get("sid", "").upper() == station_id:
+                    coords = feat["geometry"]["coordinates"]  # [lon, lat]
+                    lon, lat = float(coords[0]), float(coords[1])
+                    break
+        except Exception:
+            pass
+
+    latlon_str = f"{lat}, {lon}" if lat is not None else ""
+
+    clean_data = {
+        "p":  p_arr  * units.hPa,
+        "z":  z_arr  * units.m,
+        "T":  T_arr  * units.degC,
+        "Td": Td_arr * units.degC,
+        "u":  u_arr  * units("m/s"),
+        "v":  v_arr  * units("m/s"),
+        "site_info": {
+            "site-id":     station_id,
+            "site-name":   station_id,
+            "site-lctn":   "",
+            "site-latlon": latlon_str,
+            "site-lat":    lat,
+            "site-lon":    lon,
+            "source":      "IEM RAOB (full resolution)",
+            "valid-time":  prof.get("valid", ts),
+        },
+    }
+    return clean_data
+
+
+def _fetch_bufkit_rap(station, year, month, day, hour):
+    """Fetch RAP f00 BUFKIT from Iowa State mtarchive and return a clean_data dict.
+
+    BUFKIT format: column order defined once in the SNPARM header line using
+    semicolons; data rows are plain space-separated floats with no per-block
+    header.  Heights (HGHT) are metres MSL.  Terminator row is all 99999.
+    """
+    import urllib.request
+    from metpy.units import units as munits
+
+    station_lower = station.lower()
+    url = (f"https://mtarchive.geol.iastate.edu"
+           f"/{int(year)}/{int(month):02d}/{int(day):02d}"
+           f"/bufkit/{int(hour):02d}/rap/rap_{station_lower}.buf")
+
+    req = urllib.request.Request(url, headers={"User-Agent": "soundingtool/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        lines = resp.read().decode('ascii', errors='replace').splitlines()
+
+    # Parse column order from SNPARM line at top of file
+    # e.g.  SNPARM = PRES;TMPC;TMWC;DWPC;THTE;DRCT;SKNT;OMEG;CFRL;HGHT
+    snparm_line = next((l for l in lines[:30] if l.strip().startswith('SNPARM')), None)
+    if snparm_line is None:
+        raise ValueError("No SNPARM line in BUFKIT file")
+    cols = [c.strip() for c in snparm_line.split('=', 1)[1].split(';')]
+    try:
+        ip  = cols.index('PRES'); iz  = cols.index('HGHT')
+        it  = cols.index('TMPC'); id_ = cols.index('DWPC')
+        idr = cols.index('DRCT'); isk = cols.index('SKNT')
+    except ValueError as e:
+        raise ValueError(f"BUFKIT SNPARM missing column: {e}")
+
+    # Locate the first STIM = 0 block
+    stim0 = next((i for i, l in enumerate(lines) if 'STIM = 0' in l), None)
+    if stim0 is None:
+        raise ValueError("No STIM=0 block in BUFKIT file")
+
+    # Column header after STIM=0 starts with 'PRES' (may span 2 lines)
+    hdr = next((i for i in range(stim0 + 1, min(stim0 + 20, len(lines)))
+                if lines[i].strip().startswith('PRES')), None)
+    if hdr is None:
+        raise ValueError("No column header found after STIM=0")
+
+    # Data begins immediately after the (2-line) column header
+    data_start = hdr + 2
+
+    # Each level spans 2 lines (e.g. 8 values then 2 values); join pairs
+    p_l, z_l, T_l, Td_l, u_l, v_l = [], [], [], [], [], []
+
+    i = data_start
+    while i + 1 < len(lines):
+        parts = (lines[i] + ' ' + lines[i + 1]).split()
+        i += 2
+        if not parts:
+            continue
+        try:
+            if float(parts[0]) > 99990:
+                break
+        except ValueError:
+            break
+
+        try:
+            pres = float(parts[ip]); hght = float(parts[iz])
+            tmpc = float(parts[it]); dwpc = float(parts[id_])
+            drct = float(parts[idr]); sknt = float(parts[isk])
+        except (ValueError, IndexError):
+            continue
+
+        if pres <= 0 or tmpc < -9990 or hght < -9990:
+            continue
+        if dwpc < -9990:
+            dwpc = tmpc - 40.0
+        if drct < -9990 or sknt < -9990:
+            continue
+
+        spd_ms   = sknt * 0.514444
+        drct_rad = np.radians(drct)
+        p_l.append(pres); z_l.append(hght)
+        T_l.append(tmpc); Td_l.append(dwpc)
+        u_l.append(-spd_ms * np.sin(drct_rad))
+        v_l.append(-spd_ms * np.cos(drct_rad))
+
+    if not p_l:
+        raise ValueError("No valid levels parsed from BUFKIT data")
+
+    order = np.argsort(np.array(z_l, dtype=float))
+    def _s(a): return np.array(a, dtype=float)[order]
+
+    return {
+        'p':  _s(p_l)  * munits.hPa,
+        'z':  _s(z_l)  * munits.m,
+        'T':  _s(T_l)  * munits.degC,
+        'Td': _s(Td_l) * munits.degC,
+        'u':  _s(u_l)  * munits('m/s'),
+        'v':  _s(v_l)  * munits('m/s'),
+    }
+
+
+def _extend_with_model(clean_data, year, month, day, hour):
+    """Append RAP/RUC levels above the balloon ceiling, if needed for Bunkers.
+
+    Tries BUFKIT RAP f00 first (recent dates); falls back to RAP/RUC reanalysis.
+    Returns (extended_clean_data, n_model_levels_added, warning_str_or_None).
+    """
+    import datetime as dt
+
+    z_m = _mag(clean_data['z'], 'm')
+
+    si         = clean_data.get('site_info', {})
+    station_id = si.get('site-id', '')
+    lat        = si.get('site-lat')
+    lon        = si.get('site-lon')
+
+    try:
+        import sounderpy as spy
+    except ImportError:
+        return clean_data, 0, "sounderpy not installed — cannot fill upper levels with RAP/RUC"
+
+    from metpy.units import units as munits
+
+    model_data = None
+
+    # Try BUFKIT RAP f00 first (works for recent dates, ~last 30 days)
+    # BUFKIT uses 3-letter IDs; IEM returns 4-letter ICAO (e.g. KOUN → OUN)
+    bufkit_id = (station_id[1:] if len(station_id) == 4 and station_id.startswith('K')
+                 else station_id)
+    try:
+        model_data = _fetch_bufkit_rap(bufkit_id, year, month, day, hour)
+    except Exception as _bufkit_err:
+        import sys
+        print(f"[soundingtool] BUFKIT fetch failed ({_bufkit_err}), trying reanalysis", file=sys.stderr)
+        model_data = None
+
+    # Fall back to archived RAP/RUC reanalysis (works for dates > ~1 month old)
+    if model_data is None and lat is not None and lon is not None:
+        model_data = spy.get_model_data(
+            'rap-ruc', [float(lat), float(lon)],
+            str(year), str(month), str(day), str(hour),
+            box_avg_size=0.1, hush=True,
+        )
+
+    if model_data is None:
+        return clean_data, 0, "Could not fetch RAP/RUC data (BUFKIT and reanalysis both failed)"
+
+    z_ceil = z_m[-1]
+    mz = _mag(model_data['z'], 'm')
+    above = mz > z_ceil
+    if not above.any():
+        return clean_data, 0, "RAP/RUC profile has no levels above balloon ceiling"
+
+    n_model = int(above.sum())
+    p_arr  = np.concatenate([_mag(clean_data['p'],  'hPa'),  _mag(model_data['p'],  'hPa')[above]])
+    z_arr  = np.concatenate([_mag(clean_data['z'],  'm'),    mz[above]])
+    T_arr  = np.concatenate([_mag(clean_data['T'],  'degC'), _mag(model_data['T'],  'degC')[above]])
+    Td_arr = np.concatenate([_mag(clean_data['Td'], 'degC'), _mag(model_data['Td'], 'degC')[above]])
+    u_arr  = np.concatenate([_mag(clean_data['u'],  'm/s'),  _mag(model_data['u'],  'm/s')[above]])
+    v_arr  = np.concatenate([_mag(clean_data['v'],  'm/s'),  _mag(model_data['v'],  'm/s')[above]])
+
+    order = np.argsort(z_arr)
+    p_arr, z_arr, T_arr, Td_arr, u_arr, v_arr = (
+        p_arr[order], z_arr[order], T_arr[order],
+        Td_arr[order], u_arr[order], v_arr[order],
+    )
+
+    extended = {
+        'p':  p_arr  * munits.hPa,
+        'z':  z_arr  * munits.m,
+        'T':  T_arr  * munits.degC,
+        'Td': Td_arr * munits.degC,
+        'u':  u_arr  * munits('m/s'),
+        'v':  v_arr  * munits('m/s'),
+        'site_info': si,
+    }
+    return extended, n_model, None
 
 
 # ---------------------------------------------------------------------------
@@ -346,25 +648,33 @@ class SoundingTool(tk.Tk):
         threading.Thread(target=self._fetch_worker, daemon=True).start()
 
     def _fetch_worker(self):
-        try:
-            import sounderpy as spy
-        except ImportError:
-            self.after(0, lambda: self._fetch_error(
-                "sounderpy is not installed.\nRun:  pip install sounderpy"))
-            return
-
         tab = self._nb.index(self._nb.select())
         try:
             if tab == 0:
-                clean_data = spy.get_obs_data(
+                clean_data = _fetch_iem_raob(
                     self._obs_station.get().upper(),
                     self._obs_year.get(),
                     self._obs_month.get(),
                     self._obs_day.get(),
                     self._obs_hour.get(),
-                    hush=True,
                 )
+                clean_data, _n_model, _fill_warn = _extend_with_model(
+                    clean_data,
+                    self._obs_year.get(),
+                    self._obs_month.get(),
+                    self._obs_day.get(),
+                    self._obs_hour.get(),
+                )
+                if _fill_warn:
+                    import sys
+                    print(f"[soundingtool] RAP/RUC fill: {_fill_warn}", file=sys.stderr)
             else:
+                try:
+                    import sounderpy as spy
+                except ImportError:
+                    self.after(0, lambda: self._fetch_error(
+                        "sounderpy is not installed.\nRun:  pip install sounderpy"))
+                    return
                 ds = self._model_dataset.get().strip() or None
                 clean_data = spy.get_model_data(
                     self._model_name.get(),
@@ -387,22 +697,21 @@ class SoundingTool(tk.Tk):
             self.after(0, lambda e=exc: self._fetch_error(f"Conversion error: {e}"))
             return
 
-        u_rm, v_rm = compute_bunkers(clean_data)
-        self.after(0, lambda: self._fetch_done(clean_data, lines, u_rm, v_rm))
+        u_rm, v_rm, bunkers_err = compute_bunkers(clean_data)
+        self.after(0, lambda: self._fetch_done(clean_data, lines, u_rm, v_rm, bunkers_err))
 
     def _fetch_error(self, msg):
         self._fetch_btn.config(state="normal")
         self._set_status("Error — see dialog")
         messagebox.showerror("Fetch error", msg)
 
-    def _fetch_done(self, clean_data, lines, u_rm, v_rm):
+    def _fetch_done(self, clean_data, lines, u_rm, v_rm, bunkers_err=None):
         self._fetch_btn.config(state="normal")
         self._clean_data = clean_data
         self._cm1_lines  = lines
         self._u_rm       = u_rm
         self._v_rm       = v_rm
 
-        # Populate Bunkers display
         if u_rm is not None:
             self._umove_var.set(f"{u_rm:+.3f}")
             self._vmove_var.set(f"{v_rm:+.3f}")
@@ -417,11 +726,17 @@ class SoundingTool(tk.Tk):
         si   = clean_data.get("site_info", {}) or {}
         sid  = si.get("site-id",   "?")
         snam = si.get("site-name", "")
-        self._set_status(
-            f"Fetched {len(lines)-1} levels  |  {sid} {snam}  |  "
-            f"umove = {u_rm:+.2f} m/s,  vmove = {v_rm:+.2f} m/s  —  ready to save."
-            if u_rm is not None else
-            f"Fetched {len(lines)-1} levels  |  {sid} {snam}  —  ready to save.")
+        nlev = len(lines) - 1
+
+        if u_rm is not None:
+            self._set_status(
+                f"Fetched {nlev} levels  |  {sid} {snam}  |  "
+                f"umove = {u_rm:+.2f} m/s,  vmove = {v_rm:+.2f} m/s  —  ready to save.")
+        else:
+            reason = f": {bunkers_err}" if bunkers_err else ""
+            self._set_status(
+                f"Fetched {nlev} levels  |  {sid} {snam}  |  "
+                f"Bunkers failed{reason}")
 
     # ── save ─────────────────────────────────────────────────────────────────
 
