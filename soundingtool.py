@@ -257,27 +257,32 @@ def _fetch_iem_raob(station, year, month, day, hour):
     return clean_data
 
 
-def _fetch_bufkit_rap(station, year, month, day, hour):
-    """Fetch RAP f00 BUFKIT from Iowa State mtarchive and return a clean_data dict.
+def _fetch_bufkit(station, model, year, month, day, hour, fhour=0, local_path=None):
+    """Fetch a BUFKIT sounding for any model/forecast hour.
 
-    BUFKIT format: column order defined once in the SNPARM header line using
-    semicolons; data rows are plain space-separated floats with no per-block
-    header.  Heights (HGHT) are metres MSL.  Terminator row is all 99999.
+    If *local_path* is given the file is read from disk instead of fetched.
+    Station should be a 3-letter BUFKIT ID (e.g. 'OUN'); model is lowercase
+    ('rap', 'hrrr', 'nam', 'nam4km', 'gfs', 'sref').
+    Heights (HGHT) are metres MSL.  STIM is seconds from model init time.
     """
+    import datetime
     import urllib.request
     from metpy.units import units as munits
 
-    station_lower = station.lower()
-    url = (f"https://mtarchive.geol.iastate.edu"
-           f"/{int(year)}/{int(month):02d}/{int(day):02d}"
-           f"/bufkit/{int(hour):02d}/rap/rap_{station_lower}.buf")
+    if local_path:
+        with open(local_path, 'r', errors='replace') as fh:
+            lines = fh.read().splitlines()
+    else:
+        station_lower = station.lower()
+        model_lower   = model.lower()
+        url = (f"https://mtarchive.geol.iastate.edu"
+               f"/{int(year)}/{int(month):02d}/{int(day):02d}"
+               f"/bufkit/{int(hour):02d}/{model_lower}/{model_lower}_{station_lower}.buf")
+        req = urllib.request.Request(url, headers={"User-Agent": "soundingtool/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            lines = resp.read().decode('ascii', errors='replace').splitlines()
 
-    req = urllib.request.Request(url, headers={"User-Agent": "soundingtool/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        lines = resp.read().decode('ascii', errors='replace').splitlines()
-
-    # Parse column order from SNPARM line at top of file
-    # e.g.  SNPARM = PRES;TMPC;TMWC;DWPC;THTE;DRCT;SKNT;OMEG;CFRL;HGHT
+    # SNPARM column order
     snparm_line = next((l for l in lines[:30] if l.strip().startswith('SNPARM')), None)
     if snparm_line is None:
         raise ValueError("No SNPARM line in BUFKIT file")
@@ -289,35 +294,68 @@ def _fetch_bufkit_rap(station, year, month, day, hour):
     except ValueError as e:
         raise ValueError(f"BUFKIT SNPARM missing column: {e}")
 
-    # Locate the first STIM = 0 block
-    stim0 = next((i for i, l in enumerate(lines) if 'STIM = 0' in l), None)
-    if stim0 is None:
-        raise ValueError("No STIM=0 block in BUFKIT file")
+    # Station metadata from file header
+    def _hdr(key):
+        for l in lines[:60]:
+            s = l.strip()
+            if s.startswith(key + ' =') or s.startswith(key + '='):
+                return s.split('=', 1)[1].strip()
+        return None
+    stid = _hdr('STID') or station.upper()
+    try:    slat = float(_hdr('SLAT'))
+    except: slat = None
+    try:    slon = float(_hdr('SLON'))
+    except: slon = None
+    try:    selv = float(_hdr('SELV'))
+    except: selv = None
 
-    # Column header after STIM=0 starts with 'PRES' (may span multiple lines)
-    hdr = next((i for i in range(stim0 + 1, min(stim0 + 20, len(lines)))
+    # Collect all STIM block positions (STIM is in seconds from init)
+    stim_blocks = []
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if 'STIM' in s and '=' in s and s.startswith('STIM'):
+            try:
+                stim_val = int(float(s.split('=', 1)[1].strip()))
+                stim_blocks.append((stim_val, i))
+            except (ValueError, IndexError):
+                pass
+    if not stim_blocks:
+        raise ValueError("No STIM blocks found in BUFKIT file")
+    stim_blocks.sort(key=lambda x: x[0])
+
+    target_stim = int(fhour) * 3600
+    block = next((b for b in stim_blocks if b[0] == target_stim), None)
+    if block is None:
+        avail = [b[0] // 3600 for b in stim_blocks]
+        raise ValueError(
+            f"Forecast hour {fhour} not found in file.\n"
+            f"Available hours: {avail}")
+    stim_line_idx = block[1]
+
+    # Find PRES column header line after this STIM block
+    hdr = next((i for i in range(stim_line_idx + 1, min(stim_line_idx + 20, len(lines)))
                 if lines[i].strip().startswith('PRES')), None)
     if hdr is None:
-        raise ValueError("No column header found after STIM=0")
+        raise ValueError(f"No column header found after fhour={fhour} STIM block")
 
-    # Collect every float value from after the header until the 99999 terminator,
-    # ignoring line breaks entirely (BUFKIT splits levels across variable # of lines)
+    # Limit data collection to before the next STIM block
+    next_stim_idx = next((si for sv, si in stim_blocks if si > stim_line_idx), len(lines))
+
     raw = []
-    for line in lines[hdr + 1:]:
+    for line in lines[hdr + 1 : next_stim_idx]:
         parts = line.split()
         if not parts:
             continue
         try:
             vals = [float(x) for x in parts]
         except ValueError:
-            continue                      # non-numeric line (STID etc.) → stop
+            continue
         if vals[0] > 99990:
-            break                         # 99999 terminator
+            break
         raw.extend(vals)
 
-    n = len(cols)  # values per sounding level (from SNPARM)
+    n = len(cols)
     p_l, z_l, T_l, Td_l, u_l, v_l = [], [], [], [], [], []
-
     for k in range(0, len(raw) - n + 1, n):
         rec = raw[k:k + n]
         try:
@@ -326,14 +364,12 @@ def _fetch_bufkit_rap(station, year, month, day, hour):
             drct = rec[idr]; sknt = rec[isk]
         except IndexError:
             continue
-
         if pres <= 0 or pres > 99990 or tmpc < -9990 or hght < -9990:
             continue
         if dwpc < -9990:
             dwpc = tmpc - 40.0
         if drct < -9990 or sknt < -9990:
             continue
-
         spd_ms   = sknt * 0.514444
         drct_rad = np.radians(drct)
         p_l.append(pres); z_l.append(hght)
@@ -347,6 +383,13 @@ def _fetch_bufkit_rap(station, year, month, day, hour):
     order = np.argsort(np.array(z_l, dtype=float))
     def _s(a): return np.array(a, dtype=float)[order]
 
+    try:
+        init_dt  = datetime.datetime(int(year), int(month), int(day), int(hour))
+        valid_dt = init_dt + datetime.timedelta(hours=int(fhour))
+        valid_str = valid_dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        valid_str = f"{year}-{month}-{day} {hour}Z f{fhour:02d}"
+
     return {
         'p':  _s(p_l)  * munits.hPa,
         'z':  _s(z_l)  * munits.m,
@@ -354,7 +397,22 @@ def _fetch_bufkit_rap(station, year, month, day, hour):
         'Td': _s(Td_l) * munits.degC,
         'u':  _s(u_l)  * munits('m/s'),
         'v':  _s(v_l)  * munits('m/s'),
+        'site_info': {
+            'site-id':     stid,
+            'site-name':   stid,
+            'site-lctn':   f"elev {selv:.0f} m" if selv is not None else "",
+            'site-latlon': f"{slat}, {slon}" if slat is not None else "",
+            'site-lat':    slat,
+            'site-lon':    slon,
+            'source':      f"BUFKIT {model.upper()} f{int(fhour):02d}",
+            'valid-time':  valid_str,
+        },
     }
+
+
+def _fetch_bufkit_rap(station, year, month, day, hour):
+    """Backwards-compatible wrapper: RAP f00 from Iowa State mtarchive."""
+    return _fetch_bufkit(station, 'rap', year, month, day, hour, fhour=0)
 
 
 def _extend_with_model(clean_data, year, month, day, hour):
@@ -496,12 +554,15 @@ class SoundingTool(tk.Tk):
         nb.pack(fill="x", padx=10, pady=(10, 4))
         self._nb = nb
 
-        self._tab_obs   = ttk.Frame(nb)
-        self._tab_model = ttk.Frame(nb)
-        nb.add(self._tab_obs,   text="Observed (RAOB / IGRA)")
-        nb.add(self._tab_model, text="Model reanalysis (RAP-RUC / ERA5 / NCEP)")
+        self._tab_obs    = ttk.Frame(nb)
+        self._tab_model  = ttk.Frame(nb)
+        self._tab_bufkit = ttk.Frame(nb)
+        nb.add(self._tab_obs,    text="Observed (RAOB / IGRA)")
+        nb.add(self._tab_model,  text="Model reanalysis (RAP-RUC / ERA5 / NCEP)")
+        nb.add(self._tab_bufkit, text="BUFKIT")
         self._build_obs_tab()
         self._build_model_tab()
+        self._build_bufkit_tab()
 
         # Output directory
         out = ttk.LabelFrame(self, text="Output  →  {base_dir}/output/")
@@ -643,6 +704,71 @@ class SoundingTool(tk.Tk):
                      values=["00", "03", "06", "09", "12", "15", "18", "21"],
                      state="readonly").grid(row=2, column=7, sticky="w", **P)
 
+    # ── BUFKIT tab ──────────────────────────────────────────────────────────
+
+    def _build_bufkit_tab(self):
+        f, P = self._tab_bufkit, {"padx": 6, "pady": 6}
+
+        # Row 0: station / model / forecast hour
+        ttk.Label(f, text="Station:").grid(row=0, column=0, sticky="e", **P)
+        self._buf_station = tk.StringVar(value="OUN")
+        ttk.Entry(f, textvariable=self._buf_station, width=8).grid(
+            row=0, column=1, sticky="w", **P)
+        ttk.Label(f, text="(3-letter BUFKIT ID)",
+                  foreground="gray").grid(row=0, column=2, sticky="w", **P)
+
+        ttk.Label(f, text="Model:").grid(row=0, column=3, sticky="e", **P)
+        self._buf_model = tk.StringVar(value="rap")
+        ttk.Combobox(f, textvariable=self._buf_model, width=8,
+                     values=["rap", "hrrr", "nam", "nam4km", "gfs", "sref"],
+                     state="readonly").grid(row=0, column=4, sticky="w", **P)
+
+        ttk.Label(f, text="Forecast hour:").grid(row=0, column=5, sticky="e", **P)
+        self._buf_fhour = tk.IntVar(value=0)
+        ttk.Spinbox(f, from_=0, to=240, width=5,
+                    textvariable=self._buf_fhour).grid(row=0, column=6, sticky="w", **P)
+
+        # Row 1: init date/time
+        ttk.Label(f, text="Init year:").grid(row=1, column=0, sticky="e", **P)
+        self._buf_year = tk.StringVar(value="2026")
+        ttk.Entry(f, textvariable=self._buf_year, width=6).grid(
+            row=1, column=1, sticky="w", **P)
+
+        ttk.Label(f, text="Month:").grid(row=1, column=2, sticky="e", **P)
+        self._buf_month = tk.StringVar(value="04")
+        ttk.Combobox(f, textvariable=self._buf_month, width=5,
+                     values=[f"{m:02d}" for m in range(1, 13)],
+                     state="readonly").grid(row=1, column=3, sticky="w", **P)
+
+        ttk.Label(f, text="Day:").grid(row=1, column=4, sticky="e", **P)
+        self._buf_day = tk.StringVar(value="13")
+        ttk.Combobox(f, textvariable=self._buf_day, width=5,
+                     values=[f"{d:02d}" for d in range(1, 32)],
+                     state="readonly").grid(row=1, column=5, sticky="w", **P)
+
+        ttk.Label(f, text="Hour (UTC):").grid(row=1, column=6, sticky="e", **P)
+        self._buf_hour = tk.StringVar(value="00")
+        ttk.Combobox(f, textvariable=self._buf_hour, width=5,
+                     values=["00", "03", "06", "09", "12", "15", "18", "21"],
+                     state="readonly").grid(row=1, column=7, sticky="w", **P)
+
+        # Row 2: optional local file
+        ttk.Label(f, text="Local .buf file:").grid(row=2, column=0, sticky="e", **P)
+        self._buf_localfile = tk.StringVar(value="")
+        ttk.Entry(f, textvariable=self._buf_localfile, width=48).grid(
+            row=2, column=1, columnspan=6, sticky="w", **P)
+        ttk.Button(f, text="Browse…", command=self._browse_bufkit).grid(
+            row=2, column=7, sticky="w", **P)
+        ttk.Label(f, text="(leave blank to fetch from Iowa State BUFKIT archive)",
+                  foreground="gray").grid(row=3, column=1, columnspan=7, sticky="w", **P)
+
+    def _browse_bufkit(self):
+        path = filedialog.askopenfilename(
+            title="Open BUFKIT file",
+            filetypes=[("BUFKIT files", "*.buf *.BUF"), ("All files", "*.*")])
+        if path:
+            self._buf_localfile.set(path)
+
     # ── helpers ─────────────────────────────────────────────────────────────
 
     def _browse_dir(self):
@@ -668,7 +794,7 @@ class SoundingTool(tk.Tk):
             return (f"_{sta}_{self._obs_year.get()}"
                     f"{self._obs_month.get()}{self._obs_day.get()}"
                     f"_{self._obs_hour.get()}Z")
-        else:
+        elif tab == 1:
             lat = self._model_lat.get().replace("-", "S").replace(".", "p")
             lon = self._model_lon.get().replace("-", "W").replace(".", "p")
             return (f"_{self._model_name.get()}"
@@ -676,6 +802,17 @@ class SoundingTool(tk.Tk):
                     f"{self._model_month.get()}{self._model_day.get()}"
                     f"_{self._model_hour.get()}Z"
                     f"_{lat}_{lon}")
+        else:  # tab == 2: BUFKIT
+            try:
+                fhour = int(self._buf_fhour.get())
+            except (tk.TclError, ValueError):
+                fhour = 0
+            sta = self._buf_station.get().upper()
+            return (f"_{self._buf_model.get().upper()}_{sta}"
+                    f"_{self._buf_year.get()}"
+                    f"{self._buf_month.get()}{self._buf_day.get()}"
+                    f"_{self._buf_hour.get()}Z"
+                    f"_f{fhour:02d}")
 
     # ── fetch ────────────────────────────────────────────────────────────────
 
@@ -710,7 +847,7 @@ class SoundingTool(tk.Tk):
                 if _fill_warn:
                     import sys
                     print(f"[soundingtool] RAP/RUC fill: {_fill_warn}", file=sys.stderr)
-            else:
+            elif tab == 1:
                 try:
                     import sounderpy as spy
                 except ImportError:
@@ -728,6 +865,22 @@ class SoundingTool(tk.Tk):
                     dataset=ds,
                     box_avg_size=float(self._model_box.get()),
                     hush=True,
+                )
+            else:  # tab == 2: BUFKIT
+                try:
+                    fhour = int(self._buf_fhour.get())
+                except (tk.TclError, ValueError):
+                    fhour = 0
+                local_path = self._buf_localfile.get().strip() or None
+                clean_data = _fetch_bufkit(
+                    self._buf_station.get().strip(),
+                    self._buf_model.get(),
+                    self._buf_year.get(),
+                    self._buf_month.get(),
+                    self._buf_day.get(),
+                    self._buf_hour.get(),
+                    fhour=fhour,
+                    local_path=local_path,
                 )
         except Exception as exc:
             self.after(0, lambda e=exc: self._fetch_error(str(e)))
