@@ -781,6 +781,7 @@ class CM1Viewer(tk.Tk):
         self.v_gif_t0     = tk.StringVar(value='0')
         self.v_gif_t1     = tk.StringVar(value='')
         self.v_live       = tk.BooleanVar(value=True)
+        self.v_composite  = tk.BooleanVar(value=False)
         # radar
         self.v_radar_band     = tk.StringVar(value='S')
         self.v_radar_dish     = tk.DoubleVar(value=4.2)
@@ -914,6 +915,10 @@ class CM1Viewer(tk.Tk):
         # Level / slice position
         lf = ttk.LabelFrame(parent, text="Level / position")
         lf.pack(fill='x', padx=6, pady=4)
+
+        ttk.Checkbutton(lf, text="Composite (column max magnitude)",
+                        variable=self.v_composite,
+                        command=self._plot).pack(anchor='w', padx=6, pady=(4, 0))
 
         ttk.Label(lf, text="Z level (plan view):").pack(anchor='w', padx=6, pady=2)
         self._z_slider = ttk.Scale(lf, from_=0, to=1, orient='horizontal',
@@ -1775,19 +1780,30 @@ class CM1Viewer(tk.Tk):
         frac = float(self._cs_slider.get())
 
         if view == 'plan':
-            # data is (nz, ny, nx); select level ki → (ny, nx)
-            plot_data = data[ki, :, :]
+            if self.v_composite.get():
+                # Max-magnitude composite: pick the level with largest |value|
+                # and keep the original sign so signed cmaps work correctly.
+                abs_idx   = np.argmax(np.abs(data), axis=0)       # (ny, nx)
+                ix        = np.arange(data.shape[1])[:, None]
+                iy        = np.arange(data.shape[2])[None, :]
+                plot_data = data[abs_idx, ix, iy]
+                title_z   = "composite"
+                wind_ki   = ki   # still overlay winds at the selected level
+            else:
+                plot_data = data[ki, :, :]
+                title_z   = f"z = {zh[ki]:.2f} km"
+                wind_ki   = ki
             vmin, vmax = self._get_range(plot_data)
             im = ax.pcolormesh(xh, yh, plot_data,
                                cmap=cmap, norm=Normalize(vmin, vmax),
                                shading='nearest')
             self._add_colorbar(im, field)
             if self.v_winds.get():
-                self._overlay_winds_plan(ax, ki, xh, yh, t_sec)
+                self._overlay_winds_plan(ax, wind_ki, xh, yh, t_sec)
             ax.set_xlabel('x  (km)')
             ax.set_ylabel('y  (km)')
             ax.set_title(
-                f"{field}  —  z = {zh[ki]:.2f} km,  t = {t_str}"
+                f"{field}  —  {title_z},  t = {t_str}"
                 f"  [{self._ds.get_units(field)}]",
                 fontsize=10)
 
